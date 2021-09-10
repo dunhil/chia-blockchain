@@ -54,7 +54,8 @@ def large_block_generator(size):
 
 class TestCostCalculation:
     @pytest.mark.asyncio
-    async def test_basics(self):
+    @pytest.mark.parametrize("rust_checker", [True, False])
+    async def test_basics(self, rust_checker: bool):
         wallet_tool = bt.get_pool_wallet_tool()
         ph = wallet_tool.get_new_puzzlehash()
         num_blocks = 3
@@ -63,7 +64,7 @@ class TestCostCalculation:
         )
         coinbase = None
         for coin in blocks[2].get_included_reward_coins():
-            if coin.puzzle_hash == ph:
+            if coin.puzzle_hash == ph and coin.amount == 250000000000:
                 coinbase = coin
                 break
         assert coinbase is not None
@@ -76,17 +77,25 @@ class TestCostCalculation:
         program: BlockGenerator = simple_solution_generator(spend_bundle)
 
         npc_result: NPCResult = get_name_puzzle_conditions(
-            program, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=False
+            program,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=False,
+            rust_checker=rust_checker,
         )
 
         cost = calculate_cost_of_program(program.program, npc_result, test_constants.COST_PER_BYTE)
 
         assert npc_result.error is None
+        assert len(bytes(program.program)) == 433
+
         coin_name = npc_result.npc_list[0].coin_name
         error, puzzle, solution = get_puzzle_and_solution_for_coin(
             program, coin_name, test_constants.MAX_BLOCK_COST_CLVM
         )
         assert error is None
+
+        assert npc_result.clvm_cost == 404560
 
         # Create condition + agg_sig_condition + length + cpu_cost
         assert (
@@ -94,11 +103,12 @@ class TestCostCalculation:
             == ConditionCost.CREATE_COIN.value
             + ConditionCost.AGG_SIG.value
             + len(bytes(program.program)) * test_constants.COST_PER_BYTE
-            + npc_result.clvm_cost
+            + 404560  # clvm_cost
         )
 
     @pytest.mark.asyncio
-    async def test_strict_mode(self):
+    @pytest.mark.parametrize("rust_checker", [True, False])
+    async def test_strict_mode(self, rust_checker: bool):
         wallet_tool = bt.get_pool_wallet_tool()
         ph = wallet_tool.get_new_puzzlehash()
 
@@ -133,11 +143,19 @@ class TestCostCalculation:
         )
         generator = BlockGenerator(program, [])
         npc_result: NPCResult = get_name_puzzle_conditions(
-            generator, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=True
+            generator,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=True,
+            rust_checker=rust_checker,
         )
         assert npc_result.error is not None
-        npc_result: NPCResult = get_name_puzzle_conditions(
-            generator, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=False
+        npc_result = get_name_puzzle_conditions(
+            generator,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=False,
+            rust_checker=rust_checker,
         )
         assert npc_result.error is None
 
@@ -148,7 +166,8 @@ class TestCostCalculation:
         assert error is None
 
     @pytest.mark.asyncio
-    async def test_clvm_strict_mode(self):
+    @pytest.mark.parametrize("rust_checker", [True, False])
+    async def test_clvm_strict_mode(self, rust_checker: bool):
         block = Program.from_bytes(bytes(SMALL_BLOCK_GENERATOR.program))
         disassembly = binutils.disassemble(block)
         # this is a valid generator program except the first clvm
@@ -158,16 +177,25 @@ class TestCostCalculation:
         program = SerializedProgram.from_bytes(binutils.assemble(f"(i (0xfe (q . 0)) (q . ()) {disassembly})").as_bin())
         generator = BlockGenerator(program, [])
         npc_result: NPCResult = get_name_puzzle_conditions(
-            generator, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=True
+            generator,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=True,
+            rust_checker=rust_checker,
         )
         assert npc_result.error is not None
-        npc_result: NPCResult = get_name_puzzle_conditions(
-            generator, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=False
+        npc_result = get_name_puzzle_conditions(
+            generator,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=False,
+            rust_checker=rust_checker,
         )
         assert npc_result.error is None
 
     @pytest.mark.asyncio
-    async def test_tx_generator_speed(self):
+    @pytest.mark.parametrize("rust_checker", [True, False])
+    async def test_tx_generator_speed(self, rust_checker: bool):
         LARGE_BLOCK_COIN_CONSUMED_COUNT = 687
         generator_bytes = large_block_generator(LARGE_BLOCK_COIN_CONSUMED_COUNT)
         program = SerializedProgram.from_bytes(generator_bytes)
@@ -175,7 +203,11 @@ class TestCostCalculation:
         start_time = time.time()
         generator = BlockGenerator(program, [])
         npc_result = get_name_puzzle_conditions(
-            generator, test_constants.MAX_BLOCK_COST_CLVM, cost_per_byte=test_constants.COST_PER_BYTE, safe_mode=False
+            generator,
+            test_constants.MAX_BLOCK_COST_CLVM,
+            cost_per_byte=test_constants.COST_PER_BYTE,
+            safe_mode=False,
+            rust_checker=rust_checker,
         )
         end_time = time.time()
         duration = end_time - start_time
@@ -186,7 +218,8 @@ class TestCostCalculation:
         assert duration < 1
 
     @pytest.mark.asyncio
-    async def test_clvm_max_cost(self):
+    @pytest.mark.parametrize("rust_checker", [True, False])
+    async def test_clvm_max_cost(self, rust_checker: bool):
 
         block = Program.from_bytes(bytes(SMALL_BLOCK_GENERATOR.program))
         disassembly = binutils.disassemble(block)
@@ -201,14 +234,18 @@ class TestCostCalculation:
 
         # ensure we fail if the program exceeds the cost
         generator = BlockGenerator(program, [])
-        npc_result: NPCResult = get_name_puzzle_conditions(generator, 10000000, cost_per_byte=0, safe_mode=False)
+        npc_result: NPCResult = get_name_puzzle_conditions(
+            generator, 10000000, cost_per_byte=0, safe_mode=False, rust_checker=rust_checker
+        )
 
         assert npc_result.error is not None
         assert npc_result.clvm_cost == 0
 
         # raise the max cost to make sure this passes
         # ensure we pass if the program does not exceeds the cost
-        npc_result: NPCResult = get_name_puzzle_conditions(generator, 20000000, cost_per_byte=0, safe_mode=False)
+        npc_result = get_name_puzzle_conditions(
+            generator, 20000000, cost_per_byte=0, safe_mode=False, rust_checker=rust_checker
+        )
 
         assert npc_result.error is None
         assert npc_result.clvm_cost > 10000000
