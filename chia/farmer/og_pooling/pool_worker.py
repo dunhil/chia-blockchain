@@ -255,7 +255,7 @@ class PoolWorker:
         submit_response: Dict
         timeout = time.time() + 25
         done = False
-        while time.time() < timeout:
+        while not done and time.time() < timeout :
             try:
                 submit_response = await self.pool_client.submit_partial(submit_partial)
                 done = True
