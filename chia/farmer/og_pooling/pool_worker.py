@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import traceback
 from typing import Optional, Dict, Tuple, Any
 
 from blspy import G1Element, G2Element, AugSchemeMPL
@@ -85,7 +86,7 @@ class PoolWorker:
         pool_info: Dict = {}
         has_pool_info = False
 
-        client = PoolApiClient(self.pool_url)
+        client = PoolApiClient(self.pool_url, self.farmer.log)
         self.log.info(f"Connecting to pool {client.base_url}")
         while not self._shut_down and not has_pool_info:
             try:
@@ -252,10 +253,17 @@ class PoolWorker:
         self.last_partial_submit_time = time.time()
 
         submit_response: Dict
-        try:
-            submit_response = await self.pool_client.submit_partial(submit_partial)
-        except Exception as e:
-            self.log.error(f"Error submitting partial to pool: {e}")
+        timeout = time.time() + 25
+        done = False
+        while time.time() < timeout:
+            try:
+                submit_response = await self.pool_client.submit_partial(submit_partial)
+                done = True
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.log.error(f"Error submitting partial to pool: {e}\nTraceback {tb}")
+
+        if not done:
             return
 
         self.log.debug(f"Pool response: {submit_response}")
