@@ -45,7 +45,7 @@ if ($null -eq (Get-Command py -ErrorAction SilentlyContinue))
     Exit 1
 }
 
-$supportedPythonVersions = "3.10", "3.9", "3.8", "3.7"
+$supportedPythonVersions = "3.11", "3.10", "3.9", "3.8", "3.7"
 if ("$env:INSTALL_PYTHON_VERSION" -ne "")
 {
     $pythonVersion = $env:INSTALL_PYTHON_VERSION
@@ -125,6 +125,6 @@ Write-Output ""
 Write-Output "Try the Quick Start Guide to running chia-blockchain:"
 Write-Output "https://github.com/Chia-Network/chia-blockchain/wiki/Quick-Start-Guide"
 Write-Output ""
-Write-Output "To install the GUI type '.\Install-gui.ps1' after '.\venv\scripts\Activate.ps1'."
+Write-Output "To install the GUI run '.\venv\scripts\Activate.ps1' then '.\Install-gui.ps1'."
 Write-Output ""
 Write-Output "Type '.\venv\Scripts\Activate.ps1' and then 'chia init' to begin."

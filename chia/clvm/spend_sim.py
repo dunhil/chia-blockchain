@@ -1,31 +1,36 @@
+from __future__ import annotations
+
+import json
 import random
-from pathlib import Path
-
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any, Type, TypeVar, Callable
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 
-from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.consensus.block_rewards import calculate_base_farmer_reward, calculate_pool_reward
+from chia.consensus.coinbase import create_farmer_coin, create_pool_coin
+from chia.consensus.constants import ConsensusConstants
+from chia.consensus.cost_calculator import NPCResult
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
+from chia.full_node.bundle_tools import simple_solution_generator
+from chia.full_node.coin_store import CoinStore
+from chia.full_node.mempool import Mempool
+from chia.full_node.mempool_check_conditions import get_name_puzzle_conditions, get_puzzle_and_solution_for_coin
+from chia.full_node.mempool_manager import MempoolManager
 from chia.types.blockchain_format.coin import Coin
-from chia.types.mempool_item import MempoolItem
-from chia.util.ints import uint64, uint32
-from chia.util.hash import std_hash
-from chia.util.errors import Err, ValidationError
-from chia.util.db_wrapper import DBWrapper2
-from chia.util.streamable import Streamable, streamable
+from chia.types.blockchain_format.program import INFINITE_COST
+from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_record import CoinRecord
-from chia.types.spend_bundle import SpendBundle
+from chia.types.coin_spend import CoinSpend
 from chia.types.generator_types import BlockGenerator
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
-from chia.types.coin_spend import CoinSpend
-from chia.full_node.bundle_tools import simple_solution_generator
-from chia.full_node.mempool_manager import MempoolManager
-from chia.full_node.coin_store import CoinStore
-from chia.full_node.mempool_check_conditions import get_puzzle_and_solution_for_coin
-from chia.consensus.constants import ConsensusConstants
-from chia.consensus.default_constants import DEFAULT_CONSTANTS
-from chia.consensus.coinbase import create_pool_coin, create_farmer_coin
-from chia.consensus.block_rewards import calculate_pool_reward, calculate_base_farmer_reward
-from chia.consensus.cost_calculator import NPCResult
+from chia.types.mempool_item import MempoolItem
+from chia.types.spend_bundle import SpendBundle
+from chia.util.db_wrapper import DBWrapper2
+from chia.util.errors import Err, ValidationError
+from chia.util.hash import std_hash
+from chia.util.ints import uint32, uint64
+from chia.util.streamable import Streamable, streamable
 
 """
 The purpose of this file is to provide a lightweight simulator for the testing of Chialisp smart contracts.
@@ -36,6 +41,45 @@ BlockRecord objects for trimmed down versions.
 There is also a provided NodeClient object which implements many of the methods from chia.rpc.full_node_rpc_client
 and is designed so that you could test with it and then swap in a real rpc client that uses the same code you tested.
 """
+
+
+@asynccontextmanager
+async def sim_and_client(
+    db_path: Optional[Path] = None, defaults: ConsensusConstants = DEFAULT_CONSTANTS, pass_prefarm: bool = True
+) -> AsyncIterator[Tuple[SpendSim, SimClient]]:
+    sim: SpendSim = await SpendSim.create(db_path, defaults)
+    try:
+        client: SimClient = SimClient(sim)
+        if pass_prefarm:
+            await sim.farm_block()
+        yield sim, client
+    finally:
+        await sim.close()
+
+
+class CostLogger:
+    def __init__(self) -> None:
+        self.cost_dict: Dict[str, int] = {}
+        self.cost_dict_no_puzs: Dict[str, int] = {}
+
+    def add_cost(self, descriptor: str, spend_bundle: SpendBundle) -> SpendBundle:
+        program: BlockGenerator = simple_solution_generator(spend_bundle)
+        npc_result: NPCResult = get_name_puzzle_conditions(
+            program, INFINITE_COST, cost_per_byte=DEFAULT_CONSTANTS.COST_PER_BYTE, mempool_mode=True
+        )
+        self.cost_dict[descriptor] = npc_result.cost
+        cost_to_subtract: int = 0
+        for cs in spend_bundle.coin_spends:
+            cost_to_subtract += len(bytes(cs.puzzle_reveal)) * DEFAULT_CONSTANTS.COST_PER_BYTE
+        self.cost_dict_no_puzs[descriptor] = npc_result.cost - cost_to_subtract
+        return spend_bundle
+
+    def log_cost_statistics(self) -> str:
+        merged_dict = {
+            "standard cost": self.cost_dict,
+            "no puzzle reveals": self.cost_dict_no_puzs,
+        }
+        return json.dumps(merged_dict, indent=4)
 
 
 @streamable
@@ -85,7 +129,6 @@ _T_SpendSim = TypeVar("_T_SpendSim", bound="SpendSim")
 
 
 class SpendSim:
-
     db_wrapper: DBWrapper2
     coin_store: CoinStore
     mempool_manager: MempoolManager
@@ -123,8 +166,7 @@ class SpendSim:
                 self.block_height = store_data.block_height
                 self.block_records = store_data.block_records
                 self.blocks = store_data.blocks
-                # Create a protocol to make BlockRecord and SimBlockRecord interchangeable.
-                self.mempool_manager.peak = self.block_records[-1]  # type: ignore[assignment]
+                self.mempool_manager.peak = self.block_records[-1]
             else:
                 self.timestamp = uint64(1)
                 self.block_height = uint32(0)
@@ -144,8 +186,7 @@ class SpendSim:
         await self.db_wrapper.close()
 
     async def new_peak(self) -> None:
-        # Create a protocol to make BlockRecord and SimBlockRecord interchangeable.
-        await self.mempool_manager.new_peak(self.block_records[-1], None)  # type: ignore[arg-type]
+        await self.mempool_manager.new_peak(self.block_records[-1], None)
 
     def new_coin_record(self, coin: Coin, coinbase: bool = False) -> CoinRecord:
         return CoinRecord(
@@ -178,13 +219,12 @@ class SpendSim:
     async def farm_block(
         self,
         puzzle_hash: bytes32 = bytes32(b"0" * 32),
-        item_inclusion_filter: Optional[Callable[[MempoolManager, MempoolItem], bool]] = None,
+        item_inclusion_filter: Optional[Callable[[bytes32], bool]] = None,
     ) -> Tuple[List[Coin], List[Coin]]:
         # Fees get calculated
         fees = uint64(0)
-        if self.mempool_manager.mempool.spends:
-            for _, item in self.mempool_manager.mempool.spends.items():
-                fees = uint64(fees + item.spend_bundle.fees())
+        for item in self.mempool_manager.mempool.all_spends():
+            fees = uint64(fees + item.fee)
 
         # Rewards get created
         next_block_height: uint32 = uint32(self.block_height + 1) if len(self.block_records) > 0 else self.block_height
@@ -208,10 +248,10 @@ class SpendSim:
         generator_bundle: Optional[SpendBundle] = None
         return_additions: List[Coin] = []
         return_removals: List[Coin] = []
-        if (len(self.block_records) > 0) and (self.mempool_manager.mempool.spends):
+        if (len(self.block_records) > 0) and (self.mempool_manager.mempool.size() > 0):
             peak = self.mempool_manager.peak
             if peak is not None:
-                result = await self.mempool_manager.create_bundle_from_mempool(peak.header_hash, item_inclusion_filter)
+                result = self.mempool_manager.create_bundle_from_mempool(peak.header_hash, item_inclusion_filter)
 
                 if result is not None:
                     bundle, additions, removals = result
@@ -257,7 +297,8 @@ class SpendSim:
         self.block_records = new_br_list
         self.blocks = new_block_list
         await self.coin_store.rollback_to_block(block_height)
-        self.mempool_manager.mempool.spends = {}
+        old_pool = self.mempool_manager.mempool
+        self.mempool_manager.mempool = Mempool(old_pool.mempool_info, old_pool.fee_estimator)
         self.block_height = block_height
         if new_br_list:
             self.timestamp = new_br_list[-1].timestamp
@@ -271,14 +312,15 @@ class SimClient:
 
     async def push_tx(self, spend_bundle: SpendBundle) -> Tuple[MempoolInclusionStatus, Optional[Err]]:
         try:
+            spend_bundle_id = spend_bundle.name()
             cost_result: NPCResult = await self.service.mempool_manager.pre_validate_spendbundle(
-                spend_bundle, None, spend_bundle.name()
+                spend_bundle, None, spend_bundle_id
             )
         except ValidationError as e:
             return MempoolInclusionStatus.FAILED, e.code
         assert self.service.mempool_manager.peak
         cost, status, error = await self.service.mempool_manager.add_spend_bundle(
-            spend_bundle, cost_result, spend_bundle.name(), self.service.mempool_manager.peak.height
+            spend_bundle, cost_result, spend_bundle_id, self.service.mempool_manager.peak.height
         )
         return status, error
 
@@ -385,12 +427,12 @@ class SimClient:
             return CoinSpend(coin_record.coin, puzzle, solution)
 
     async def get_all_mempool_tx_ids(self) -> List[bytes32]:
-        return list(self.service.mempool_manager.mempool.spends.keys())
+        return self.service.mempool_manager.mempool.all_spend_ids()
 
     async def get_all_mempool_items(self) -> Dict[bytes32, MempoolItem]:
         spends = {}
-        for tx_id, item in self.service.mempool_manager.mempool.spends.items():
-            spends[tx_id] = item
+        for item in self.service.mempool_manager.mempool.all_spends():
+            spends[item.name] = item
         return spends
 
     async def get_mempool_item_by_tx_id(self, tx_id: bytes32) -> Optional[Dict[str, Any]]:

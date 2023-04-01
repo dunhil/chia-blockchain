@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
 
 class WalletProtocol(Protocol):
-
     # TODO: it seems like this should return WalletType instead
     @classmethod
     def type(cls) -> uint8:
@@ -59,6 +58,9 @@ class WalletProtocol(Protocol):
         ...
 
     def require_derivation_paths(self) -> bool:
+        ...
+
+    def get_name(self) -> str:
         ...
 
     # WalletStateManager is only imported for type hinting thus leaving pylint

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from typing import Any, AsyncIterator, Iterator, List
+from typing import Any, Iterator, List
 
 import pytest
-import pytest_asyncio
 
 from chia.data_layer.data_layer_wallet import DataLayerWallet, Mirror
-from chia.simulator.setup_nodes import SimulatorsAndWallets, setup_simulators_and_wallets
+from chia.simulator.setup_nodes import SimulatorsAndWallets
 from chia.simulator.simulator_protocol import FarmNewBlockProtocol
-from chia.simulator.time_out_assert import time_out_assert
+from chia.simulator.time_out_assert import adjusted_timeout, time_out_assert
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -39,38 +38,15 @@ async def is_singleton_confirmed(dl_wallet: DataLayerWallet, lid: bytes32) -> bo
 
 
 class TestDLWallet:
-    @pytest_asyncio.fixture(scope="function")
-    async def wallet_node(self) -> AsyncIterator[SimulatorsAndWallets]:
-        async for _ in setup_simulators_and_wallets(1, 1, {}):
-            yield _
-
-    @pytest_asyncio.fixture(scope="function")
-    async def two_wallet_nodes(self) -> AsyncIterator[SimulatorsAndWallets]:
-        async for _ in setup_simulators_and_wallets(1, 2, {}):
-            yield _
-
-    @pytest_asyncio.fixture(scope="function")
-    async def three_wallet_nodes(self) -> AsyncIterator[SimulatorsAndWallets]:
-        async for _ in setup_simulators_and_wallets(1, 3, {}):
-            yield _
-
-    @pytest_asyncio.fixture(scope="function")
-    async def two_wallet_nodes_five_freeze(self) -> AsyncIterator[SimulatorsAndWallets]:
-        async for _ in setup_simulators_and_wallets(1, 2, {}):
-            yield _
-
-    @pytest_asyncio.fixture(scope="function")
-    async def three_sim_two_wallets(self) -> AsyncIterator[SimulatorsAndWallets]:
-        async for _ in setup_simulators_and_wallets(3, 2, {}):
-            yield _
-
     @pytest.mark.parametrize(
         "trusted",
         [True, False],
     )
     @pytest.mark.asyncio
-    async def test_initial_creation(self, wallet_node: SimulatorsAndWallets, trusted: bool) -> None:
-        full_nodes, wallets, _ = wallet_node
+    async def test_initial_creation(
+        self, self_hostname: str, simulator_and_wallet: SimulatorsAndWallets, trusted: bool
+    ) -> None:
+        full_nodes, wallets, _ = simulator_and_wallet
         full_node_api = full_nodes[0]
         full_node_server = full_node_api.server
         wallet_node_0, server_0 = wallets[0]
@@ -81,9 +57,9 @@ class TestDLWallet:
         else:
             wallet_node_0.config["trusted_peers"] = {}
 
-        await server_0.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
+        await server_0.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
 
-        funds = await full_node_api.farm_blocks(count=2, wallet=wallet_0)
+        funds = await full_node_api.farm_blocks_to_wallet(count=2, wallet=wallet_0)
 
         await time_out_assert(10, wallet_0.get_unconfirmed_balance, funds)
         await time_out_assert(10, wallet_0.get_confirmed_balance, funds)
@@ -117,8 +93,10 @@ class TestDLWallet:
         [True, False],
     )
     @pytest.mark.asyncio
-    async def test_get_owned_singletons(self, wallet_node: SimulatorsAndWallets, trusted: bool) -> None:
-        full_nodes, wallets, _ = wallet_node
+    async def test_get_owned_singletons(
+        self, self_hostname: str, simulator_and_wallet: SimulatorsAndWallets, trusted: bool
+    ) -> None:
+        full_nodes, wallets, _ = simulator_and_wallet
         full_node_api = full_nodes[0]
         full_node_server = full_node_api.server
         wallet_node_0, server_0 = wallets[0]
@@ -129,9 +107,9 @@ class TestDLWallet:
         else:
             wallet_node_0.config["trusted_peers"] = {}
 
-        await server_0.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
+        await server_0.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
 
-        funds = await full_node_api.farm_blocks(count=2, wallet=wallet_0)
+        funds = await full_node_api.farm_blocks_to_wallet(count=2, wallet=wallet_0)
 
         await time_out_assert(10, wallet_0.get_unconfirmed_balance, funds)
         await time_out_assert(10, wallet_0.get_confirmed_balance, funds)
@@ -169,7 +147,9 @@ class TestDLWallet:
         [True, False],
     )
     @pytest.mark.asyncio
-    async def test_tracking_non_owned(self, two_wallet_nodes: SimulatorsAndWallets, trusted: bool) -> None:
+    async def test_tracking_non_owned(
+        self, self_hostname: str, two_wallet_nodes: SimulatorsAndWallets, trusted: bool
+    ) -> None:
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
         full_node_server = full_node_api.server
@@ -185,10 +165,10 @@ class TestDLWallet:
             wallet_node_0.config["trusted_peers"] = {}
             wallet_node_1.config["trusted_peers"] = {}
 
-        await server_0.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
-        await server_1.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
+        await server_0.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
+        await server_1.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
 
-        funds = await full_node_api.farm_blocks(count=2, wallet=wallet_0)
+        funds = await full_node_api.farm_blocks_to_wallet(count=2, wallet=wallet_0)
 
         await time_out_assert(10, wallet_0.get_unconfirmed_balance, funds)
         await time_out_assert(10, wallet_0.get_confirmed_balance, funds)
@@ -249,8 +229,10 @@ class TestDLWallet:
         [True, False],
     )
     @pytest.mark.asyncio
-    async def test_lifecycle(self, wallet_node: SimulatorsAndWallets, trusted: bool) -> None:
-        full_nodes, wallets, _ = wallet_node
+    async def test_lifecycle(
+        self, self_hostname: str, simulator_and_wallet: SimulatorsAndWallets, trusted: bool
+    ) -> None:
+        full_nodes, wallets, _ = simulator_and_wallet
         full_node_api = full_nodes[0]
         full_node_server = full_node_api.server
         wallet_node_0, server_0 = wallets[0]
@@ -261,9 +243,9 @@ class TestDLWallet:
         else:
             wallet_node_0.config["trusted_peers"] = {}
 
-        await server_0.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
+        await server_0.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
 
-        funds = await full_node_api.farm_blocks(count=5, wallet=wallet_0)
+        funds = await full_node_api.farm_blocks_to_wallet(count=5, wallet=wallet_0)
 
         await time_out_assert(10, wallet_0.get_unconfirmed_balance, funds)
         await time_out_assert(10, wallet_0.get_confirmed_balance, funds)
@@ -344,7 +326,7 @@ class TestDLWallet:
         [True, False],
     )
     @pytest.mark.asyncio
-    async def test_rebase(self, two_wallet_nodes: SimulatorsAndWallets, trusted: bool) -> None:
+    async def test_rebase(self, self_hostname: str, two_wallet_nodes: SimulatorsAndWallets, trusted: bool) -> None:
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
         full_node_server = full_node_api.server
@@ -360,11 +342,11 @@ class TestDLWallet:
             wallet_node_0.config["trusted_peers"] = {}
             wallet_node_1.config["trusted_peers"] = {}
 
-        await server_0.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
-        await server_1.start_client(PeerInfo("localhost", uint16(full_node_server._port)), None)
+        await server_0.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
+        await server_1.start_client(PeerInfo(self_hostname, uint16(full_node_server._port)), None)
 
-        funds = await full_node_api.farm_blocks(count=5, wallet=wallet_0)
-        await full_node_api.farm_blocks(count=5, wallet=wallet_1)
+        funds = await full_node_api.farm_blocks_to_wallet(count=5, wallet=wallet_0)
+        await full_node_api.farm_blocks_to_wallet(count=5, wallet=wallet_1)
 
         await time_out_assert(10, wallet_0.get_unconfirmed_balance, funds)
         await time_out_assert(10, wallet_0.get_confirmed_balance, funds)
@@ -394,7 +376,10 @@ class TestDLWallet:
 
         await wallet_node_0.wallet_state_manager.add_pending_transaction(dl_record)
         await wallet_node_0.wallet_state_manager.add_pending_transaction(std_record)
-        await asyncio.wait_for(full_node_api.process_transaction_records(records=[dl_record, std_record]), timeout=15)
+        await asyncio.wait_for(
+            full_node_api.process_transaction_records(records=[dl_record, std_record]),
+            timeout=adjusted_timeout(timeout=15),
+        )
 
         await time_out_assert(15, is_singleton_confirmed, True, dl_wallet_0, launcher_id)
         await asyncio.sleep(0.5)
@@ -425,12 +410,17 @@ class TestDLWallet:
         for tx in report_txs:
             await wallet_node_1.wallet_state_manager.add_pending_transaction(tx)
 
-        await asyncio.wait_for(full_node_api.wait_transaction_records_entered_mempool(records=report_txs), timeout=15)
+        await asyncio.wait_for(
+            full_node_api.wait_transaction_records_entered_mempool(records=report_txs),
+            timeout=adjusted_timeout(timeout=15),
+        )
 
         for tx in update_txs:
             await wallet_node_0.wallet_state_manager.add_pending_transaction(tx)
 
-        await asyncio.wait_for(full_node_api.process_transaction_records(records=report_txs), timeout=15)
+        await asyncio.wait_for(
+            full_node_api.process_transaction_records(records=report_txs), timeout=adjusted_timeout(timeout=15)
+        )
 
         funds -= 2000000000001
 
@@ -488,7 +478,9 @@ class TestDLWallet:
         for tx in update_txs_0:
             await wallet_node_0.wallet_state_manager.add_pending_transaction(tx)
 
-        await asyncio.wait_for(full_node_api.process_transaction_records(records=update_txs_1), timeout=15)
+        await asyncio.wait_for(
+            full_node_api.process_transaction_records(records=update_txs_1), timeout=adjusted_timeout(timeout=15)
+        )
 
         async def does_singleton_have_root(wallet: DataLayerWallet, lid: bytes32, root: bytes32) -> bool:
             latest_singleton = await wallet.get_latest_singleton(lid)

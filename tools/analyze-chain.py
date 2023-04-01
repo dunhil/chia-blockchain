@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import sqlite3
 import sys
-import zstd
-import click
 from functools import partial
 from pathlib import Path
-from blspy import AugSchemeMPL, G1Element
-
-from typing import Callable, Optional, Union, List
 from time import time
+from typing import Callable, List, Optional, Union
 
-from chia_rs import run_generator, MEMPOOL_MODE
+import click
+import zstd
+from blspy import AugSchemeMPL, G1Element
+from chia_rs import MEMPOOL_MODE, run_generator
 
-from chia.types.blockchain_format.program import Program
 from chia.consensus.default_constants import DEFAULT_CONSTANTS
-from chia.wallet.puzzles.rom_bootstrap_generator import get_generator
-from chia.util.full_block_utils import block_info_from_block, generator_from_block
-from chia.util.condition_tools import pkm_pairs
-from chia.types.full_block import FullBlock
-from chia.types.blockchain_format.sized_bytes import bytes32, bytes48
 from chia.types.block_protocol import BlockInfo
+from chia.types.blockchain_format.program import Program
+from chia.types.blockchain_format.sized_bytes import bytes32, bytes48
+from chia.types.full_block import FullBlock
+from chia.util.condition_tools import pkm_pairs
+from chia.util.full_block_utils import block_info_from_block, generator_from_block
+from chia.wallet.puzzles.rom_bootstrap_generator import get_generator
 
 GENERATOR_ROM = bytes(get_generator())
 
@@ -70,7 +71,6 @@ def callable_for_module_function_path(call: str) -> Callable:
 @click.option("--end", default=None, help="last block to examine")
 @click.option("--call", default=None, help="function to pass block iterator to in form `module:function`")
 def main(file: Path, mempool_mode: bool, start: int, end: Optional[int], call: Optional[str], verify_signatures: bool):
-
     call_f: Callable[[Union[BlockInfo, FullBlock], bytes32, int, List[bytes], float, int], None]
     if call is None:
         call_f = partial(default_call, verify_signatures)
@@ -155,7 +155,7 @@ def default_call(
         # create hash_key list for aggsig check
         pairs_pks: List[bytes48] = []
         pairs_msgs: List[bytes] = []
-        pairs_pks, pairs_msgs = pkm_pairs(result, DEFAULT_CONSTANTS.AGG_SIG_ME_ADDITIONAL_DATA)
+        pairs_pks, pairs_msgs = pkm_pairs(result, DEFAULT_CONSTANTS.AGG_SIG_ME_ADDITIONAL_DATA, soft_fork=False)
         pairs_g1s = [G1Element.from_bytes(x) for x in pairs_pks]
         assert block.transactions_info is not None
         assert block.transactions_info.aggregated_signature is not None

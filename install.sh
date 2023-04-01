@@ -3,10 +3,11 @@
 set -o errexit
 
 USAGE_TEXT="\
-Usage: $0 [-adsph]
+Usage: $0 [-adlsph]
 
   -a                          automated install, no questions
   -d                          install development dependencies
+  -l                          install legacy keyring dependencies (linux only)
   -s                          skip python package installation and just do pip install
   -p                          additional plotters installation
   -h                          display this help and exit
@@ -21,7 +22,7 @@ EXTRAS=
 SKIP_PACKAGE_INSTALL=
 PLOTTER_INSTALL=
 
-while getopts adsph flag
+while getopts adlsph flag
 do
   case "${flag}" in
     # automated
@@ -31,6 +32,8 @@ do
     # simple install
     s) SKIP_PACKAGE_INSTALL=1;;
     p) PLOTTER_INSTALL=1;;
+    # legacy keyring
+    l) EXTRAS=${EXTRAS}legacy_keyring,;;
     h) usage; exit 0;;
     *) echo; usage; exit 1;;
   esac
@@ -143,7 +146,7 @@ OPENSSL_VERSION_INT=
 find_python() {
   set +e
   unset BEST_VERSION
-  for V in 310 3.10 39 3.9 38 3.8 37 3.7 3; do
+  for V in 311 3.11 310 3.10 39 3.9 38 3.8 37 3.7 3; do
     if command -v python$V >/dev/null; then
       if [ "$BEST_VERSION" = "" ]; then
         BEST_VERSION=$V
@@ -281,8 +284,8 @@ if ! command -v "$INSTALL_PYTHON_PATH" >/dev/null; then
   exit 1
 fi
 
-if [ "$PYTHON_MAJOR_VER" -ne "3" ] || [ "$PYTHON_MINOR_VER" -lt "7" ] || [ "$PYTHON_MINOR_VER" -ge "11" ]; then
-  echo "Chia requires Python version >= 3.7 and  < 3.11.0" >&2
+if [ "$PYTHON_MAJOR_VER" -ne "3" ] || [ "$PYTHON_MINOR_VER" -lt "7" ] || [ "$PYTHON_MINOR_VER" -ge "12" ]; then
+  echo "Chia requires Python version >= 3.7 and  < 3.12.0" >&2
   echo "Current Python version = $INSTALL_PYTHON_VERSION" >&2
   # If Arch, direct to Arch Wiki
   if type pacman >/dev/null 2>&1 && [ -f "/etc/arch-release" ]; then
@@ -359,6 +362,6 @@ echo ""
 echo "Try the Quick Start Guide to running chia-blockchain:"
 echo "https://github.com/Chia-Network/chia-blockchain/wiki/Quick-Start-Guide"
 echo ""
-echo "To install the GUI type 'sh install-gui.sh' after '. ./activate'."
+echo "To install the GUI run '. ./activate' then 'sh install-gui.sh'."
 echo ""
 echo "Type '. ./activate' and then 'chia init' to begin."
