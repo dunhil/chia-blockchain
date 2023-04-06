@@ -9,6 +9,7 @@ on:
       - 'long_lived/**'
       - main
       - 'release/**'
+      - 'sweetrel/**'
   release:
     types: [published]
   pull_request:
