@@ -9,11 +9,11 @@ import chia.server.ws_connection as ws
 from chia.consensus.pot_iterations import calculate_sp_interval_iters, calculate_iterations_quality
 from chia.farmer.og_pooling.pool_api_client import PoolApiClient
 from chia.farmer.og_pooling.pool_protocol import PartialPayloadOG, SubmitPartialOG
+from chia.harvester.harvester_api import HarvesterAPI
 from chia.protocols import farmer_protocol, harvester_protocol
-from chia.types.blockchain_format.proof_of_space import ProofOfSpace, generate_plot_public_key
+from chia.types.blockchain_format.proof_of_space import generate_plot_public_key
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.util.bech32m import encode_puzzle_hash
-from chia.util.byte_types import hexstr_to_bytes
 from chia.util.config import load_config, save_config
 from chia.util.ints import uint64, uint32
 
@@ -225,7 +225,7 @@ class PoolWorker:
             new_proof_of_space.sp_hash,
             [m_to_sign],
         )
-        sign_response: Any = await peer.request_signatures(request)
+        sign_response: Any = await peer.call_api(HarvesterAPI.request_signatures, request)
         if not isinstance(sign_response, harvester_protocol.RespondSignatures):
             self.log.error(f"Invalid response from harvester: {sign_response}")
             return
