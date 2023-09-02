@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from chia_rs import ALLOW_BACKREFS
+
 from chia.consensus.block_record import BlockRecord
+from chia.consensus.blockchain import Blockchain, BlockchainMutexPriority
 from chia.consensus.cost_calculator import NPCResult
 from chia.consensus.pos_quality import UI_ACTUAL_SPACE_CONSTANT_FACTOR
 from chia.full_node.fee_estimator_interface import FeeEstimatorInterface
@@ -29,6 +32,46 @@ from chia.util.ws_message import WsRpcMessage, create_payload_dict
 def coin_record_dict_backwards_compat(coin_record: Dict[str, Any]) -> Dict[str, bool]:
     coin_record["spent"] = coin_record["spent_block_index"] > 0
     return coin_record
+
+
+async def get_nearest_transaction_block(blockchain: Blockchain, block: BlockRecord) -> BlockRecord:
+    if block.is_transaction_block:
+        return block
+
+    prev_hash = blockchain.height_to_hash(block.prev_transaction_block_height)
+    # Genesis block is a transaction block, so theoretically `prev_hash` of all blocks
+    # other than genesis block cannot be `None`.
+    assert prev_hash
+
+    tb = await blockchain.get_block_record_from_db(prev_hash)
+    assert tb
+
+    return tb
+
+
+async def get_average_block_time(
+    blockchain: Blockchain,
+    base_block: BlockRecord,
+    height_distance: int,
+) -> Optional[uint32]:
+    newer_block = await get_nearest_transaction_block(blockchain, base_block)
+    if newer_block.height < 1:
+        return None
+
+    prev_height = uint32(max(1, newer_block.height - height_distance))
+    prev_hash = blockchain.height_to_hash(prev_height)
+    assert prev_hash
+    prev_block = await blockchain.get_block_record_from_db(prev_hash)
+    assert prev_block
+
+    older_block = await get_nearest_transaction_block(blockchain, prev_block)
+
+    assert newer_block.timestamp is not None and older_block.timestamp is not None
+
+    average_block_time = uint32(
+        (newer_block.timestamp - older_block.timestamp) / (newer_block.height - older_block.height)
+    )
+    return average_block_time
 
 
 class FullNodeRpcApi:
@@ -128,6 +171,7 @@ class FullNodeRpcApi:
                     "difficulty": 0,
                     "sub_slot_iters": 0,
                     "space": 0,
+                    "average_block_time": None,
                     "mempool_size": 0,
                     "mempool_cost": 0,
                     "mempool_min_fees": {
@@ -166,6 +210,7 @@ class FullNodeRpcApi:
         else:
             sync_progress_height = uint32(0)
 
+        average_block_time: Optional[uint32] = None
         if peak is not None and peak.height > 1:
             newer_block_hex = peak.header_hash.hex()
             # Average over the last day
@@ -175,6 +220,7 @@ class FullNodeRpcApi:
             space = await self.get_network_space(
                 {"newer_block_header_hash": newer_block_hex, "older_block_header_hash": older_block_hex}
             )
+            average_block_time = await get_average_block_time(self.service.blockchain, peak, 4608)
         else:
             space = {"space": uint128(0)}
 
@@ -212,6 +258,7 @@ class FullNodeRpcApi:
                 "difficulty": difficulty,
                 "sub_slot_iters": sub_slot_iters,
                 "space": space["space"],
+                "average_block_time": average_block_time,
                 "mempool_size": mempool_size,
                 "mempool_cost": mempool_cost,
                 "mempool_fees": mempool_fees,
@@ -694,14 +741,12 @@ class FullNodeRpcApi:
 
         block_generator: Optional[BlockGenerator] = await self.service.blockchain.get_block_generator(block)
         assert block_generator is not None
-        error, puzzle, solution = get_puzzle_and_solution_for_coin(block_generator, coin_record.coin)
-        if error is not None:
-            raise ValueError(f"Error: {error}")
+        flags = 0
+        if height >= self.service.constants.HARD_FORK_HEIGHT:
+            flags = ALLOW_BACKREFS
 
-        assert puzzle is not None
-        assert solution is not None
-
-        return {"coin_solution": CoinSpend(coin_record.coin, puzzle, solution)}
+        spend_info = get_puzzle_and_solution_for_coin(block_generator, coin_record.coin, flags)
+        return {"coin_solution": CoinSpend(coin_record.coin, spend_info.puzzle, spend_info.solution)}
 
     async def get_additions_and_removals(self, request: Dict[str, Any]) -> EndpointResult:
         if "header_hash" not in request:
@@ -712,7 +757,7 @@ class FullNodeRpcApi:
         if block is None:
             raise ValueError(f"Block {header_hash.hex()} not found")
 
-        async with self.service._blockchain_lock_low_priority:
+        async with self.service.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.low):
             if self.service.blockchain.height_to_hash(block.height) != header_hash:
                 raise ValueError(f"Block at {header_hash.hex()} is no longer in the blockchain (it's in a fork)")
             additions: List[CoinRecord] = await self.service.coin_store.get_coins_added_at_height(block.height)
@@ -724,12 +769,12 @@ class FullNodeRpcApi:
         }
 
     async def get_all_mempool_tx_ids(self, _: Dict[str, Any]) -> EndpointResult:
-        ids = list(self.service.mempool_manager.mempool.all_spend_ids())
+        ids = list(self.service.mempool_manager.mempool.all_item_ids())
         return {"tx_ids": ids}
 
     async def get_all_mempool_items(self, _: Dict[str, Any]) -> EndpointResult:
         spends = {}
-        for item in self.service.mempool_manager.mempool.all_spends():
+        for item in self.service.mempool_manager.mempool.all_items():
             spends[item.name.hex()] = item.to_json_dict()
         return {"mempool_items": spends}
 

@@ -65,7 +65,11 @@ class CostLogger:
     def add_cost(self, descriptor: str, spend_bundle: SpendBundle) -> SpendBundle:
         program: BlockGenerator = simple_solution_generator(spend_bundle)
         npc_result: NPCResult = get_name_puzzle_conditions(
-            program, INFINITE_COST, mempool_mode=True, height=DEFAULT_CONSTANTS.SOFT_FORK2_HEIGHT
+            program,
+            INFINITE_COST,
+            mempool_mode=True,
+            height=DEFAULT_CONSTANTS.SOFT_FORK2_HEIGHT,
+            constants=DEFAULT_CONSTANTS,
         )
         self.cost_dict[descriptor] = npc_result.cost
         cost_to_subtract: int = 0
@@ -223,7 +227,7 @@ class SpendSim:
     ) -> Tuple[List[Coin], List[Coin]]:
         # Fees get calculated
         fees = uint64(0)
-        for item in self.mempool_manager.mempool.all_spends():
+        for item in self.mempool_manager.mempool.all_items():
             fees = uint64(fees + item.fee)
 
         # Rewards get created
@@ -412,26 +416,21 @@ class SimClient:
         removals: List[CoinRecord] = await self.service.coin_store.get_coins_removed_at_height(block_height)
         return additions, removals
 
-    async def get_puzzle_and_solution(self, coin_id: bytes32, height: uint32) -> Optional[CoinSpend]:
+    async def get_puzzle_and_solution(self, coin_id: bytes32, height: uint32) -> CoinSpend:
         filtered_generators = list(filter(lambda block: block.height == height, self.service.blocks))
         # real consideration should be made for the None cases instead of just hint ignoring
         generator: BlockGenerator = filtered_generators[0].transactions_generator  # type: ignore[assignment]
         coin_record = await self.service.coin_store.get_coin_record(coin_id)
         assert coin_record is not None
-        error, puzzle, solution = get_puzzle_and_solution_for_coin(generator, coin_record.coin)
-        if error:
-            return None
-        else:
-            assert puzzle is not None
-            assert solution is not None
-            return CoinSpend(coin_record.coin, puzzle, solution)
+        spend_info = get_puzzle_and_solution_for_coin(generator, coin_record.coin, 0)
+        return CoinSpend(coin_record.coin, spend_info.puzzle, spend_info.solution)
 
     async def get_all_mempool_tx_ids(self) -> List[bytes32]:
-        return self.service.mempool_manager.mempool.all_spend_ids()
+        return self.service.mempool_manager.mempool.all_item_ids()
 
     async def get_all_mempool_items(self) -> Dict[bytes32, MempoolItem]:
         spends = {}
-        for item in self.service.mempool_manager.mempool.all_spends():
+        for item in self.service.mempool_manager.mempool.all_items():
             spends[item.name] = item
         return spends
 

@@ -6,6 +6,7 @@ from clvm_tools import binutils
 from clvm_tools.clvmc import compile_clvm_text
 
 from chia.consensus.condition_costs import ConditionCost
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.full_node.mempool_check_conditions import get_name_puzzle_conditions
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.serialized_program import SerializedProgram
@@ -40,29 +41,14 @@ GENERATOR_CODE = """
 """
 
 
-COMPILED_GENERATOR_CODE = bytes.fromhex(
-    "ff02ffff01ff04ffff02ff04ffff04ff02ffff04ff05ffff04ff0bff8080808080ffff02"
-    "ff06ffff04ff02ffff04ff05ffff04ff0bff808080808080ffff04ffff01ffff02ff05ff"
-    "1380ff02ff05ff2b80ff018080"
-)
-
 COMPILED_GENERATOR_CODE = bytes(Program.to(compile_clvm_text(GENERATOR_CODE, [])))  # type: ignore[no-untyped-call]
 
 FIRST_GENERATOR = Program.to(
-    binutils.assemble(
-        '((parent_id (c 1 (q "puzzle blob")) 50000 "solution is here" extra data for coin))'
-    )  # type: ignore[no-untyped-call]
-).as_bin()
-
-SECOND_GENERATOR = Program.to(binutils.assemble("(extra data for block)")).as_bin()  # type: ignore[no-untyped-call]
-
-
-FIRST_GENERATOR = Program.to(
-    binutils.assemble(
+    binutils.assemble(  # type: ignore[no-untyped-call]
         """
         ((0x0000000000000000000000000000000000000000000000000000000000000000 1 50000
         ((51 0x0000000000000000000000000000000000000000000000000000000000000001 500))
-        "extra" "data" "for" "coin" ))"""  # type: ignore[no-untyped-call]
+        "extra" "data" "for" "coin" ))"""
     )
 ).as_bin()
 
@@ -137,7 +123,7 @@ class TestROM:
         print(r)
 
         npc_result = get_name_puzzle_conditions(
-            gen, max_cost=MAX_COST, mempool_mode=False, height=uint32(softfork_height)
+            gen, max_cost=MAX_COST, mempool_mode=False, height=uint32(softfork_height), constants=DEFAULT_CONSTANTS
         )
         assert npc_result.error is None
         assert npc_result.cost == EXPECTED_COST + ConditionCost.CREATE_COIN.value + (
@@ -147,7 +133,9 @@ class TestROM:
 
         spend = Spend(
             coin_id=bytes32.fromhex("e8538c2d14f2a7defae65c5c97f5d4fae7ee64acef7fec9d28ad847a0880fd03"),
+            parent_id=bytes32.fromhex("0000000000000000000000000000000000000000000000000000000000000000"),
             puzzle_hash=bytes32.fromhex("9dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718ba7b2"),
+            coin_amount=50000,
             height_relative=None,
             seconds_relative=None,
             before_height_relative=None,
@@ -156,6 +144,12 @@ class TestROM:
             birth_seconds=None,
             create_coin=[(bytes([0] * 31 + [1]), 500, None)],
             agg_sig_me=[],
+            agg_sig_parent=[],
+            agg_sig_puzzle=[],
+            agg_sig_amount=[],
+            agg_sig_puzzle_amount=[],
+            agg_sig_parent_amount=[],
+            agg_sig_parent_puzzle=[],
             flags=ELIGIBLE_FOR_DEDUP,
         )
 

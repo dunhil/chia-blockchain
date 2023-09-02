@@ -6,17 +6,18 @@ import random
 from typing import Callable, Dict, List, Optional, Tuple
 
 import pytest
-from blspy import G1Element, G2Element
+from blspy import G2Element
 from clvm.casts import int_to_bytes
 from clvm_tools import binutils
 
 from chia.consensus.condition_costs import ConditionCost
 from chia.consensus.cost_calculator import NPCResult
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.full_node.bitcoin_fee_estimator import create_bitcoin_fee_estimator
 from chia.full_node.fee_estimation import EmptyMempoolInfo, MempoolInfo
 from chia.full_node.full_node_api import FullNodeAPI
 from chia.full_node.mempool import Mempool
-from chia.full_node.mempool_check_conditions import get_name_puzzle_conditions
+from chia.full_node.mempool_check_conditions import get_name_puzzle_conditions, get_puzzle_and_solution_for_coin
 from chia.full_node.mempool_manager import MEMPOOL_MIN_FEE_INCREASE
 from chia.full_node.pending_tx_cache import ConflictTxCache, PendingTxCache
 from chia.protocols import full_node_protocol, wallet_protocol
@@ -30,26 +31,33 @@ from chia.types.announcement import Announcement
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.serialized_program import SerializedProgram
-from chia.types.blockchain_format.sized_bytes import bytes32, bytes48
+from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.clvm_cost import CLVMCost
 from chia.types.coin_spend import CoinSpend
 from chia.types.condition_opcodes import ConditionOpcode
 from chia.types.condition_with_args import ConditionWithArgs
+from chia.types.eligible_coin_spends import run_for_cost
 from chia.types.fee_rate import FeeRate
 from chia.types.generator_types import BlockGenerator
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
 from chia.types.mempool_item import MempoolItem
 from chia.types.spend_bundle import SpendBundle
-from chia.types.spend_bundle_conditions import Spend, SpendBundleConditions
+from chia.types.spend_bundle_conditions import SpendBundleConditions
 from chia.util.api_decorators import api_request
-from chia.util.condition_tools import parse_sexp_to_conditions, pkm_pairs, pkm_pairs_for_conditions_dict
-from chia.util.errors import ConsensusError, Err
+from chia.util.errors import Err
 from chia.util.hash import std_hash
 from chia.util.ints import uint32, uint64
 from chia.util.recursive_replace import recursive_replace
 from tests.blockchain.blockchain_test_utils import _validate_and_add_block
 from tests.connection_utils import add_dummy_connection, connect_and_get_peer
-from tests.core.mempool.test_mempool_manager import make_test_coins, mk_item
+from tests.core.mempool.test_mempool_manager import (
+    IDENTITY_PUZZLE_HASH,
+    TEST_COIN,
+    make_test_coins,
+    mempool_item_from_spendbundle,
+    mk_item,
+    spend_bundle_from_conditions,
+)
 from tests.core.node_height import node_height_at_least
 from tests.util.misc import assert_runtime
 
@@ -1964,7 +1972,9 @@ def generator_condition_tester(
     program = SerializedProgram.from_bytes(binutils.assemble(prg).as_bin())
     generator = BlockGenerator(program, [], [])
     print(f"len: {len(bytes(program))}")
-    npc_result: NPCResult = get_name_puzzle_conditions(generator, max_cost, mempool_mode=mempool_mode, height=height)
+    npc_result: NPCResult = get_name_puzzle_conditions(
+        generator, max_cost, mempool_mode=mempool_mode, height=height, constants=DEFAULT_CONSTANTS
+    )
     return npc_result
 
 
@@ -1996,6 +2006,11 @@ class TestGeneratorConditions:
             mempool_mode=mempool,
             height=softfork_height,
         )
+
+        # with the 2.0 hard fork, division with negative numbers is allowed
+        if operand < 0 and softfork_height >= DEFAULT_CONSTANTS.HARD_FORK_HEIGHT:
+            expected = None
+
         assert npc_result.error == expected
 
     def test_invalid_condition_list_terminator(self, softfork_height):
@@ -2143,7 +2158,7 @@ class TestGeneratorConditions:
         )
         generator = BlockGenerator(program, [], [])
         npc_result: NPCResult = get_name_puzzle_conditions(
-            generator, MAX_BLOCK_COST_CLVM, mempool_mode=False, height=softfork_height
+            generator, MAX_BLOCK_COST_CLVM, mempool_mode=False, height=softfork_height, constants=DEFAULT_CONSTANTS
         )
         assert npc_result.error is None
         assert len(npc_result.conds.spends) == 2
@@ -2187,14 +2202,50 @@ class TestGeneratorConditions:
         assert coins == [(puzzle_hash_1.encode("ascii"), 5, hint.encode("ascii"))]
 
     @pytest.mark.parametrize("mempool", [True, False])
-    def test_unknown_condition(self, mempool: bool, softfork_height: uint32):
-        for c in ['(2 100 "foo" "bar")', "(100)", "(4 1) (2 2) (3 3)", '("foobar")']:
-            npc_result = generator_condition_tester(c, mempool_mode=mempool, height=softfork_height)
-            print(npc_result)
-            if mempool:
-                assert npc_result.error == Err.INVALID_CONDITION.value
-            else:
-                assert npc_result.error is None
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            '(2 100 "foo" "bar")',
+            "(100)",
+            "(4 1) (2 2) (3 3)",
+            '("foobar")',
+            '(0x100 "foobar")',
+            '(0x1ff "foobar")',
+        ],
+    )
+    def test_unknown_condition(self, mempool: bool, condition: str, softfork_height: uint32):
+        npc_result = generator_condition_tester(condition, mempool_mode=mempool, height=softfork_height)
+        print(npc_result)
+        if mempool:
+            assert npc_result.error == Err.INVALID_CONDITION.value
+        else:
+            assert npc_result.error is None
+
+    @pytest.mark.parametrize("mempool", [True, False])
+    @pytest.mark.parametrize(
+        "condition, expect_error",
+        [
+            # the softfork condition must include at least 1 argument to
+            # indicate its cost
+            ("(90)", Err.INVALID_CONDITION.value),
+            ("(90 1000000)", None),
+        ],
+    )
+    def test_softfork_condition(
+        self, mempool: bool, condition: str, expect_error: Optional[int], softfork_height: uint32
+    ):
+        npc_result = generator_condition_tester(condition, mempool_mode=mempool, height=softfork_height)
+        print(npc_result)
+
+        # in mempool all unknown conditions are always a failure
+        if mempool:
+            expect_error = Err.INVALID_CONDITION.value
+        # the SOFTFORK condition is only activated with the hard fork, so
+        # before then there are no errors
+        elif softfork_height < DEFAULT_CONSTANTS.HARD_FORK_HEIGHT:
+            expect_error = None
+
+        assert npc_result.error == expect_error
 
 
 # the tests below are malicious generator programs
@@ -2434,7 +2485,12 @@ class TestMaliciousGenerators:
     )
     @pytest.mark.benchmark
     def test_duplicate_coin_announces(self, request, opcode, softfork_height):
-        condition = CREATE_ANNOUNCE_COND.format(opcode=opcode.value[0], num=5950000)
+        # with soft-fork3, we only allow 1024 create- or assert announcements
+        # per spend
+        if softfork_height >= DEFAULT_CONSTANTS.SOFT_FORK3_HEIGHT:
+            condition = CREATE_ANNOUNCE_COND.format(opcode=opcode.value[0], num=1024)
+        else:
+            condition = CREATE_ANNOUNCE_COND.format(opcode=opcode.value[0], num=5950000)
 
         with assert_runtime(seconds=9, label=request.node.name):
             npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
@@ -2452,7 +2508,7 @@ class TestMaliciousGenerators:
         # duplicate
         condition = CREATE_COIN.format(num=600000)
 
-        with assert_runtime(seconds=0.8, label=request.node.name):
+        with assert_runtime(seconds=1, label=request.node.name):
             npc_result = generator_condition_tester(condition, quote=False, height=softfork_height)
 
         assert npc_result.error == Err.DUPLICATE_OUTPUT.value
@@ -2508,146 +2564,6 @@ def softfork_fixture(request):
     return request.param
 
 
-class TestPkmPairs:
-    h1 = bytes32(b"a" * 32)
-    h2 = bytes32(b"b" * 32)
-    h3 = bytes32(b"c" * 32)
-    h4 = bytes32(b"d" * 32)
-
-    pk1 = G1Element.generator()
-    pk2 = G1Element.generator()
-
-    def test_empty_list(self, softfork):
-        conds = SpendBundleConditions([], 0, 0, 0, None, None, [], 0, 0, 0)
-        pks, msgs = pkm_pairs(conds, b"foobar", soft_fork=softfork)
-        assert pks == []
-        assert msgs == []
-
-    def test_no_agg_sigs(self, softfork):
-        # one create coin: h1 amount: 1 and not hint
-        spends = [Spend(self.h3, self.h4, None, None, None, None, None, None, [(self.h1, 1, b"")], [], 0)]
-        conds = SpendBundleConditions(spends, 0, 0, 0, None, None, [], 0, 0, 0)
-        pks, msgs = pkm_pairs(conds, b"foobar", soft_fork=softfork)
-        assert pks == []
-        assert msgs == []
-
-    def test_agg_sig_me(self, softfork):
-        spends = [
-            Spend(
-                self.h1,
-                self.h2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [],
-                [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")],
-                0,
-            )
-        ]
-        conds = SpendBundleConditions(spends, 0, 0, 0, None, None, [], 0, 0, 0)
-        pks, msgs = pkm_pairs(conds, b"foobar", soft_fork=softfork)
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
-        assert msgs == [b"msg1" + self.h1 + b"foobar", b"msg2" + self.h1 + b"foobar"]
-
-    def test_agg_sig_unsafe(self, softfork):
-        conds = SpendBundleConditions(
-            [], 0, 0, 0, None, None, [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")], 0, 0, 0
-        )
-        pks, msgs = pkm_pairs(conds, b"foobar", soft_fork=softfork)
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
-        assert msgs == [b"msg1", b"msg2"]
-
-    def test_agg_sig_mixed(self, softfork):
-        spends = [Spend(self.h1, self.h2, None, None, None, None, None, None, [], [(bytes48(self.pk1), b"msg1")], 0)]
-        conds = SpendBundleConditions(spends, 0, 0, 0, None, None, [(bytes48(self.pk2), b"msg2")], 0, 0, 0)
-        pks, msgs = pkm_pairs(conds, b"foobar", soft_fork=softfork)
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk2), bytes(self.pk1)]
-        assert msgs == [b"msg2", b"msg1" + self.h1 + b"foobar"]
-
-    def test_agg_sig_unsafe_restriction(self) -> None:
-        conds = SpendBundleConditions(
-            [], 0, 0, 0, None, None, [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")], 0, 0, 0
-        )
-        pks, msgs = pkm_pairs(conds, b"msg1", soft_fork=False)
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
-        assert msgs == [b"msg1", b"msg2"]
-
-        pks, msgs = pkm_pairs(conds, b"msg2", soft_fork=False)
-        assert [bytes(pk) for pk in pks] == [bytes(self.pk1), bytes(self.pk2)]
-        assert msgs == [b"msg1", b"msg2"]
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs(conds, b"msg1", soft_fork=True)
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs(conds, b"sg1", soft_fork=True)
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs(conds, b"msg2", soft_fork=True)
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs(conds, b"g2", soft_fork=True)
-
-
-class TestPkmPairsForConditionDict:
-    h1 = bytes32(b"a" * 32)
-
-    pk1 = G1Element.generator()
-    pk2 = G1Element.generator()
-
-    def test_agg_sig_unsafe_restriction(self) -> None:
-        ASU = ConditionOpcode.AGG_SIG_UNSAFE
-
-        conds = {ASU: [ConditionWithArgs(ASU, [self.pk1, b"msg1"]), ConditionWithArgs(ASU, [self.pk2, b"msg2"])]}
-        tuples = pkm_pairs_for_conditions_dict(conds, self.h1, b"msg10")
-        assert tuples == [(bytes48(self.pk1), b"msg1"), (bytes48(self.pk2), b"msg2")]
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs_for_conditions_dict(conds, self.h1, b"msg1")
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs_for_conditions_dict(conds, self.h1, b"sg1")
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs_for_conditions_dict(conds, self.h1, b"msg2")
-
-        with pytest.raises(ConsensusError, match="INVALID_CONDITION"):
-            pkm_pairs_for_conditions_dict(conds, self.h1, b"g2")
-
-
-class TestParseSexpCondition:
-    def test_basic(self) -> None:
-        conds = parse_sexp_to_conditions(Program.to([[bytes([49]), b"foo", b"bar"]]))
-        assert conds == [ConditionWithArgs(ConditionOpcode.AGG_SIG_UNSAFE, [b"foo", b"bar"])]
-
-    def test_oversized_op(self) -> None:
-        with pytest.raises(ConsensusError):
-            parse_sexp_to_conditions(Program.to([[bytes([49, 49]), b"foo", b"bar"]]))
-
-    def test_empty_op(self) -> None:
-        with pytest.raises(ConsensusError):
-            parse_sexp_to_conditions(Program.to([[b"", b"foo", b"bar"]]))
-
-    def test_list_op(self) -> None:
-        with pytest.raises(ConsensusError):
-            parse_sexp_to_conditions(Program.to([[[bytes([49])], b"foo", b"bar"]]))
-
-    def test_list_arg(self) -> None:
-        conds = parse_sexp_to_conditions(Program.to([[bytes([49]), [b"foo", b"bar"]]]))
-        assert conds == [ConditionWithArgs(ConditionOpcode.AGG_SIG_UNSAFE, [])]
-
-    def test_list_arg_truncate(self) -> None:
-        conds = parse_sexp_to_conditions(Program.to([[bytes([49]), b"baz", [b"foo", b"bar"]]]))
-        assert conds == [ConditionWithArgs(ConditionOpcode.AGG_SIG_UNSAFE, [b"baz"])]
-
-    def test_arg_limit(self) -> None:
-        conds = parse_sexp_to_conditions(Program.to([[bytes([49]), b"1", b"2", b"3", b"4", b"5", b"6"]]))
-        assert conds == [ConditionWithArgs(ConditionOpcode.AGG_SIG_UNSAFE, [b"1", b"2", b"3", b"4"])]
-
-
 coins = make_test_coins()
 
 
@@ -2686,7 +2602,7 @@ coins = make_test_coins()
         ),
     ],
 )
-def test_spends_by_feerate(items: List[MempoolItem], expected: List[Coin]) -> None:
+def test_items_by_feerate(items: List[MempoolItem], expected: List[Coin]) -> None:
     fee_estimator = create_bitcoin_fee_estimator(uint64(11000000000))
 
     mempool_info = MempoolInfo(
@@ -2698,7 +2614,7 @@ def test_spends_by_feerate(items: List[MempoolItem], expected: List[Coin]) -> No
     for i in items:
         mempool.add_to_pool(i)
 
-    ordered_items = list(mempool.spends_by_feerate())
+    ordered_items = list(mempool.items_by_feerate())
 
     assert len(ordered_items) == len(expected)
 
@@ -2756,7 +2672,7 @@ def test_full_mempool(items: List[int], add: int, expected: List[int]) -> None:
     # now, add the item we're testing
     mempool.add_to_pool(item_cost(add, 3.1))
 
-    ordered_items = list(mempool.spends_by_feerate())
+    ordered_items = list(mempool.items_by_feerate())
 
     assert len(ordered_items) == len(expected)
 
@@ -2818,14 +2734,14 @@ def test_limit_expiring_transactions(height: bool, items: List[int], expected: L
 
     ordered_costs = [
         item.cost
-        for item in mempool.spends_by_feerate()
+        for item in mempool.items_by_feerate()
         if item.assert_before_height is not None or item.assert_before_seconds is not None
     ]
 
     assert ordered_costs == expected
 
     print("")
-    for item in mempool.spends_by_feerate():
+    for item in mempool.items_by_feerate():
         if item.assert_before_seconds is not None or item.assert_before_height is not None:
             ttl = "yes"
         else:
@@ -2833,3 +2749,115 @@ def test_limit_expiring_transactions(height: bool, items: List[int], expected: L
         print(f"- cost: {item.cost} TTL: {ttl}")
 
     assert mempool.total_mempool_cost() > 90
+
+
+@pytest.mark.parametrize(
+    "items,coin_ids,expected",
+    [
+        # None of these spend those coins
+        (
+            [mk_item(coins[0:1]), mk_item(coins[1:2]), mk_item(coins[2:3])],
+            [coins[3].name(), coins[4].name()],
+            [],
+        ),
+        # One of these spends one of the coins
+        (
+            [mk_item(coins[0:1]), mk_item(coins[1:2]), mk_item(coins[2:3])],
+            [coins[1].name(), coins[3].name()],
+            [mk_item(coins[1:2])],
+        ),
+        # One of these spends one another spends two
+        (
+            [mk_item(coins[0:1]), mk_item(coins[1:3]), mk_item(coins[2:4]), mk_item(coins[3:4])],
+            [coins[2].name(), coins[3].name()],
+            [mk_item(coins[1:3]), mk_item(coins[2:4]), mk_item(coins[3:4])],
+        ),
+    ],
+)
+def test_get_items_by_coin_ids(items: List[MempoolItem], coin_ids: List[bytes32], expected: List[MempoolItem]) -> None:
+    fee_estimator = create_bitcoin_fee_estimator(uint64(11000000000))
+    mempool_info = MempoolInfo(
+        CLVMCost(uint64(11000000000 * 3)),
+        FeeRate(uint64(1000000)),
+        CLVMCost(uint64(11000000000)),
+    )
+    mempool = Mempool(mempool_info, fee_estimator)
+    for i in items:
+        mempool.add_to_pool(i)
+    result = mempool.get_items_by_coin_ids(coin_ids)
+    assert set(result) == set(expected)
+
+
+def test_aggregating_on_a_solution_then_a_more_cost_saving_one_appears() -> None:
+    def always(_: bytes32) -> bool:
+        return True
+
+    def make_test_spendbundle(coin: Coin, *, fee: int = 0, with_higher_cost: bool = False) -> SpendBundle:
+        conditions = []
+        actual_fee = fee
+        if with_higher_cost:
+            conditions.extend([[ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, i] for i in range(3)])
+            actual_fee += 3
+        conditions.append([ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, coin.amount - actual_fee])
+        sb = spend_bundle_from_conditions(conditions, coin)
+        return sb
+
+    def agg_and_add_sb_returning_cost_info(mempool: Mempool, spend_bundles: List[SpendBundle]) -> uint64:
+        sb = SpendBundle.aggregate(spend_bundles)
+        mi = mempool_item_from_spendbundle(sb)
+        mempool.add_to_pool(mi)
+        saved_cost = run_for_cost(
+            sb.coin_spends[0].puzzle_reveal, sb.coin_spends[0].solution, len(mi.additions), mi.cost
+        )
+        return saved_cost
+
+    fee_estimator = create_bitcoin_fee_estimator(uint64(11000000000))
+    mempool_info = MempoolInfo(
+        CLVMCost(uint64(11000000000 * 3)),
+        FeeRate(uint64(1000000)),
+        CLVMCost(uint64(11000000000)),
+    )
+    mempool = Mempool(mempool_info, fee_estimator)
+    coins = [
+        Coin(IDENTITY_PUZZLE_HASH, IDENTITY_PUZZLE_HASH, uint64(amount)) for amount in range(2000000000, 2000000010)
+    ]
+    # Create a ~10 FPC item that spends the eligible coin[0]
+    sb_A = make_test_spendbundle(coins[0])
+    highest_fee = 58282830
+    sb_high_rate = make_test_spendbundle(coins[1], fee=highest_fee)
+    agg_and_add_sb_returning_cost_info(mempool, [sb_A, sb_high_rate])
+    # Create a ~2 FPC item that spends the eligible coin using the same solution A
+    sb_low_rate = make_test_spendbundle(coins[2], fee=highest_fee // 5)
+    saved_cost_on_solution_A = agg_and_add_sb_returning_cost_info(mempool, [sb_A, sb_low_rate])
+    result = mempool.create_bundle_from_mempool_items(always)
+    assert result is not None
+    agg, _ = result
+    # Make sure both items would be processed
+    assert [c.coin for c in agg.coin_spends] == [coins[0], coins[1], coins[2]]
+    # Now let's add 3 x ~3 FPC items that spend the eligible coin differently
+    # (solution B). It creates a higher (saved) cost than solution A
+    sb_B = make_test_spendbundle(coins[0], with_higher_cost=True)
+    for i in range(3, 6):
+        # We're picking this fee to get a ~3 FPC, and get picked after sb_A1
+        # (which has ~10 FPC) but before sb_A2 (which has ~2 FPC)
+        sb_mid_rate = make_test_spendbundle(coins[i], fee=38004852 - i)
+        saved_cost_on_solution_B = agg_and_add_sb_returning_cost_info(mempool, [sb_B, sb_mid_rate])
+    # We'd save more cost if we went with solution B instead of A
+    assert saved_cost_on_solution_B > saved_cost_on_solution_A
+    # If we process everything now, the 3 x ~3 FPC items get skipped because
+    # sb_A1 gets picked before them (~10 FPC), so from then on only sb_A2 (~2 FPC)
+    # would get picked
+    result = mempool.create_bundle_from_mempool_items(always)
+    assert result is not None
+    agg, _ = result
+    # The 3 items got skipped here
+    # We ran with solution A and missed bigger savings on solution B
+    assert mempool.size() == 5
+    assert [c.coin for c in agg.coin_spends] == [coins[0], coins[1], coins[2]]
+
+
+def test_get_puzzle_and_solution_for_coin_failure():
+    with pytest.raises(
+        ValueError, match=f"Failed to get puzzle and solution for coin {TEST_COIN}, error: failed to fill whole buffer"
+    ):
+        get_puzzle_and_solution_for_coin(BlockGenerator(SerializedProgram(), [], []), TEST_COIN, 0)
