@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Optional, Dict, Tuple, Any
 
-from blspy import G1Element, G2Element, AugSchemeMPL
+from chia_rs import G1Element, G2Element, AugSchemeMPL
 
 import chia.server.ws_connection as ws
 from chia.consensus.pot_iterations import calculate_sp_interval_iters, calculate_iterations_quality
