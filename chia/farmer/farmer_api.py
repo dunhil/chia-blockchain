@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
-from blspy import AugSchemeMPL, G2Element, PrivateKey
+from chia_rs import AugSchemeMPL, G2Element, PrivateKey
 
 from chia import __version__
 from chia.consensus.pot_iterations import calculate_iterations_quality, calculate_sp_interval_iters
@@ -194,7 +194,7 @@ class FarmerAPI:
                     increment_pool_stats(
                         self.farmer.pool_state,
                         p2_singleton_puzzle_hash,
-                        "invalid_partials",
+                        "insufficient_partials",
                         time.time(),
                     )
                     self.farmer.state_changed(
@@ -309,6 +309,7 @@ class FarmerAPI:
                     value=pool_state_dict["current_difficulty"],
                 )
                 self.farmer.log.debug(f"POST /partial request {post_partial_request}")
+                from aiohttp import ClientConnectionError
                 try:
                     if True:
                         from chia.farmer.og_pooling import pool_api_client
@@ -319,61 +320,76 @@ class FarmerAPI:
                             headers={"User-Agent": f"Chia Blockchain v.{__version__}"},
                         )
                         if True:
-                            if True:
-                                self.farmer.log.info(f"Pool response: {pool_response}")
-                                if "error_code" in pool_response:
-                                    self.farmer.log.error(
-                                        f"Error in pooling: "
-                                        f"{pool_response['error_code'], pool_response['error_message']}"
-                                    )
+                            self.farmer.log.info(f"Pool response: {pool_response}")
+                            if "error_code" in pool_response:
+                                self.farmer.log.error(
+                                    f"Error in pooling: "
+                                    f"{pool_response['error_code'], pool_response['error_message']}"
+                                )
 
+                                increment_pool_stats(
+                                    self.farmer.pool_state,
+                                    p2_singleton_puzzle_hash,
+                                    "pool_errors",
+                                    time.time(),
+                                    value=pool_response,
+                                )
+
+                                if pool_response["error_code"] == PoolErrorCode.TOO_LATE.value:
                                     increment_pool_stats(
                                         self.farmer.pool_state,
                                         p2_singleton_puzzle_hash,
-                                        "pool_errors",
+                                        "stale_partials",
                                         time.time(),
-                                        value=pool_response,
                                     )
-
-                                    if pool_response["error_code"] == PoolErrorCode.TOO_LATE.value:
-                                        increment_pool_stats(
-                                            self.farmer.pool_state,
-                                            p2_singleton_puzzle_hash,
-                                            "stale_partials",
-                                            time.time(),
-                                        )
-                                    else:
-                                        increment_pool_stats(
-                                            self.farmer.pool_state,
-                                            p2_singleton_puzzle_hash,
-                                            "invalid_partials",
-                                            time.time(),
-                                        )
-
-                                    if pool_response["error_code"] == PoolErrorCode.PROOF_NOT_GOOD_ENOUGH.value:
-                                        self.farmer.log.error(
-                                            "Partial not good enough, forcing pool farmer update to "
-                                            "get our current difficulty."
-                                        )
-                                        pool_state_dict["next_farmer_update"] = 0
-                                        await self.farmer.update_pool_state()
+                                elif pool_response["error_code"] == PoolErrorCode.PROOF_NOT_GOOD_ENOUGH.value:
+                                    self.farmer.log.error(
+                                        "Partial not good enough, forcing pool farmer update to "
+                                        "get our current difficulty."
+                                    )
+                                    increment_pool_stats(
+                                        self.farmer.pool_state,
+                                        p2_singleton_puzzle_hash,
+                                        "insufficient_partials",
+                                        time.time(),
+                                    )
+                                    pool_state_dict["next_farmer_update"] = 0
+                                    await self.farmer.update_pool_state()
                                 else:
                                     increment_pool_stats(
                                         self.farmer.pool_state,
                                         p2_singleton_puzzle_hash,
-                                        "valid_partials",
+                                        "invalid_partials",
                                         time.time(),
                                     )
-                                    new_difficulty = pool_response["new_difficulty"]
-                                    increment_pool_stats(
-                                        self.farmer.pool_state,
-                                        p2_singleton_puzzle_hash,
-                                        "points_acknowledged",
-                                        time.time(),
-                                        new_difficulty,
-                                        new_difficulty,
-                                    )
-                                    pool_state_dict["current_difficulty"] = new_difficulty
+                                return
+
+                            increment_pool_stats(
+                                self.farmer.pool_state,
+                                p2_singleton_puzzle_hash,
+                                "valid_partials",
+                                time.time(),
+                            )
+                            new_difficulty = pool_response["new_difficulty"]
+                            increment_pool_stats(
+                                self.farmer.pool_state,
+                                p2_singleton_puzzle_hash,
+                                "points_acknowledged",
+                                time.time(),
+                                new_difficulty,
+                                new_difficulty,
+                            )
+                            pool_state_dict["current_difficulty"] = new_difficulty
+                except ClientConnectionError as e:
+                    self.farmer.log.error(f"Error sending partial: {str(e)}")
+                    increment_pool_stats(
+                        self.farmer.pool_state,
+                        p2_singleton_puzzle_hash,
+                        "invalid_partials",
+                        time.time(),
+                    )
+                    return
+
                 except Exception as e:
                     self.farmer.log.error(f"Error connecting to pool: {e}")
 

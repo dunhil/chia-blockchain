@@ -28,7 +28,7 @@ async def post_partial(url: StrOrURL, *, data: Any = None, **kwargs: Any) -> Dic
                     if res.ok:
                         return await res.json()
                     else:
-                        last_error = ClientConnectionError(f"Partial submit answer error: {url}, {res.status}")
+                        last_error = ClientConnectionError(f"Partial submit resp not ok: {url}, {res.status}")
                         break
         except ClientError as e:
             partial_log.error(f"Partial submit error: {e}")
