@@ -224,6 +224,8 @@ class PoolWorker:
             new_proof_of_space.challenge_hash,
             new_proof_of_space.sp_hash,
             [m_to_sign],
+            message_data=None,
+            rc_block_unfinished=None,
         )
         sign_response: Any = await peer.call_api(HarvesterAPI.request_signatures, request)
         if not isinstance(sign_response, harvester_protocol.RespondSignatures):
