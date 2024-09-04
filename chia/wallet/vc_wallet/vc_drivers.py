@@ -10,7 +10,7 @@ from chia.types.coin_spend import CoinSpend, compute_additions, make_spend
 from chia.util.hash import std_hash
 from chia.util.ints import uint64
 from chia.util.streamable import Streamable, streamable
-from chia.wallet.conditions import Condition
+from chia.wallet.conditions import Condition, CreatePuzzleAnnouncement
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.load_clvm import load_clvm_maybe_recompile
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
@@ -329,18 +329,18 @@ class VerifiedCredential(Streamable):
     @classmethod
     def launch(
         cls: Type[_T_VerifiedCredential],
-        origin_coin: Coin,
+        origin_coins: List[Coin],
         provider_id: bytes32,
         new_inner_puzzle_hash: bytes32,
         memos: List[bytes32],
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> Tuple[Program, List[CoinSpend], _T_VerifiedCredential]:
+    ) -> Tuple[List[Program], List[CoinSpend], _T_VerifiedCredential]:
         """
         Launch a VC.
 
-        origin_coin: An XCH coin that will be used to fund the spend. A coin of any amount > 1 can be used and the
-        change will automatically go back to the coin's puzzle hash.
+        origin_coins: A set of XCH coins that will be used to fund the spend. Coins of any amount > 1 can be used and
+        change will automatically go back to the first coin's puzzle hash.
         provider_id: The DID of the proof provider (the entity who is responsible for adding/removing proofs to the vc)
         new_inner_puzzle_hash: the innermost puzzle hash once the VC is created
         memos: The memos to use on the payment to the singleton
@@ -349,6 +349,7 @@ class VerifiedCredential(Streamable):
         and an instance of this class representing the expected state after all relevant spends have been pushed and
         confirmed.
         """
+        origin_coin = origin_coins[0]
         launcher_coin: Coin = generate_launcher_coin(origin_coin, uint64(1))
 
         # Create the second puzzle for the first launch
@@ -399,20 +400,23 @@ class VerifiedCredential(Streamable):
             curried_eve_singleton_hash,
             uint64(1),
         )
+        first_launcher_announcement_hash = std_hash(launcher_coin.name() + launcher_solution.get_tree_hash())
+        second_launcher_announcement_hash = std_hash(second_launcher_coin.name() + launch_dpuz.get_tree_hash())
         create_launcher_conditions = Program.to(
             [
                 [51, SINGLETON_LAUNCHER_HASH, 1],
-                [51, origin_coin.puzzle_hash, origin_coin.amount - fee - 1],
+                [51, origin_coin.puzzle_hash, sum(c.amount for c in origin_coins) - fee - 1],
                 [52, fee],
-                [61, std_hash(launcher_coin.name() + launcher_solution.get_tree_hash())],
-                [61, std_hash(second_launcher_coin.name() + launch_dpuz.get_tree_hash())],
+                [61, first_launcher_announcement_hash],
+                [61, second_launcher_announcement_hash],
                 *[cond.to_program() for cond in extra_conditions],
             ]
         )
 
-        dpuz: Program = Program.to((1, create_launcher_conditions))
+        primary_dpuz: Program = Program.to((1, create_launcher_conditions))
+        additional_dpuzs: List[Program] = [Program.to((1, [[61, second_launcher_announcement_hash]]))]
         return (
-            dpuz,
+            [primary_dpuz, *additional_dpuzs],
             [
                 make_spend(
                     launcher_coin,
@@ -704,7 +708,7 @@ class VerifiedCredential(Streamable):
         inner_solution: Program,
         new_proof_hash: Optional[bytes32] = None,
         new_proof_provider: Optional[bytes32] = None,
-    ) -> Tuple[Optional[bytes32], CoinSpend, VerifiedCredential]:
+    ) -> Tuple[Optional[CreatePuzzleAnnouncement], CoinSpend, VerifiedCredential]:
         """
         Given an inner puzzle reveal and solution, spend the VC (potentially updating the proofs in the process).
         Note that the inner puzzle is already expected to output the 'magic' condition (which can be created above).
@@ -726,10 +730,12 @@ class VerifiedCredential(Streamable):
         )
 
         if new_proof_hash is not None:
-            expected_announcement: Optional[bytes32] = std_hash(
-                self.coin.name()
-                + Program.to(new_proof_hash).get_tree_hash()
-                + b""  # TP update is banned because singleton will leave the VC protocol
+            expected_announcement: Optional[CreatePuzzleAnnouncement] = CreatePuzzleAnnouncement(
+                std_hash(
+                    self.coin.name()
+                    + Program.to(new_proof_hash).get_tree_hash()
+                    + b""  # TP update is banned because singleton will leave the VC protocol
+                )
             )
         else:
             expected_announcement = None
@@ -755,7 +761,7 @@ class VerifiedCredential(Streamable):
 
     def activate_backdoor(
         self, provider_innerpuzhash: bytes32, announcement_nonce: Optional[bytes32] = None
-    ) -> Tuple[bytes32, CoinSpend]:
+    ) -> Tuple[CreatePuzzleAnnouncement, CoinSpend]:
         """
         Activates the backdoor in the VC to revoke the credentials and remove the provider's DID.
 
@@ -787,8 +793,8 @@ class VerifiedCredential(Streamable):
             ),
         )
 
-        expected_announcement: bytes32 = std_hash(
-            self.coin.name() + Program.to(None).get_tree_hash() + ACS_TRANSFER_PROGRAM.get_tree_hash()
+        expected_announcement: CreatePuzzleAnnouncement = CreatePuzzleAnnouncement(
+            std_hash(self.coin.name() + Program.to(None).get_tree_hash() + ACS_TRANSFER_PROGRAM.get_tree_hash())
         )
 
         return (

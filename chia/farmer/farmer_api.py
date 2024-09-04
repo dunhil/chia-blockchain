@@ -363,7 +363,11 @@ class FarmerAPI:
                             f"{pool_url}/partial",
                             json=post_partial_request.to_json_dict(),
                             ssl=ssl_context_for_root(get_mozilla_ca_crt(), log=self.farmer.log),
-                            headers={"User-Agent": f"Chia Blockchain v.{__version__}"},
+                            headers={
+                                "User-Agent": f"Chia Blockchain v.{__version__}",
+                                "chia-farmer-version": __version__,
+                                "chia-harvester-version": peer.version,
+                            },
                         )
                         if True:
                             self.farmer.log.info(f"Pool response: {pool_response}")
@@ -587,11 +591,13 @@ class FarmerAPI:
                 SignatureRequestSourceData(
                     uint8(SigningDataKind.FOLIAGE_BLOCK_DATA), bytes(full_node_request.foliage_block_data)
                 ),
-                None
-                if full_node_request.foliage_transaction_block_data is None
-                else SignatureRequestSourceData(
-                    uint8(SigningDataKind.FOLIAGE_TRANSACTION_BLOCK),
-                    bytes(full_node_request.foliage_transaction_block_data),
+                (
+                    None
+                    if full_node_request.foliage_transaction_block_data is None
+                    else SignatureRequestSourceData(
+                        uint8(SigningDataKind.FOLIAGE_TRANSACTION_BLOCK),
+                        bytes(full_node_request.foliage_transaction_block_data),
+                    )
                 ),
             ]
 

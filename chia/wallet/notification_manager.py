@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from chia_rs import G2Element
 
 from chia.protocols.wallet_protocol import CoinState
-from chia.types.announcement import Announcement
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -15,13 +13,13 @@ from chia.types.coin_spend import CoinSpend, make_spend
 from chia.types.spend_bundle import SpendBundle
 from chia.util.db_wrapper import DBWrapper2
 from chia.util.ints import uint32, uint64
-from chia.wallet.conditions import Condition
+from chia.wallet.conditions import AssertCoinAnnouncement, Condition
 from chia.wallet.notification_store import Notification, NotificationStore
-from chia.wallet.transaction_record import TransactionRecord
 from chia.wallet.util.compute_memos import compute_memos_for_spend
 from chia.wallet.util.notifications import construct_notification
 from chia.wallet.util.tx_config import TXConfig
 from chia.wallet.util.wallet_types import WalletType
+from chia.wallet.wallet_action_scope import WalletActionScope
 
 
 class NotificationManager:
@@ -89,9 +87,10 @@ class NotificationManager:
         msg: bytes,
         amount: uint64,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         coins: Set[Coin] = await self.wallet_state_manager.main_wallet.select_coins(
             uint64(amount + fee), tx_config.coin_selection_config
         )
@@ -105,18 +104,19 @@ class NotificationManager:
             Program.to(None),
         )
         extra_spend_bundle = SpendBundle([notification_spend], G2Element())
-        [chia_tx] = await self.wallet_state_manager.main_wallet.generate_signed_transaction(
+        await self.wallet_state_manager.main_wallet.generate_signed_transaction(
             amount,
             notification_hash,
             tx_config,
+            action_scope,
             fee,
             coins=coins,
             origin_id=origin_coin,
-            coin_announcements_to_consume={Announcement(notification_coin.name(), b"")},
             memos=[target, msg],
-            extra_conditions=extra_conditions,
+            extra_conditions=(
+                *extra_conditions,
+                AssertCoinAnnouncement(asserted_id=notification_coin.name(), asserted_msg=b""),
+            ),
         )
-        full_tx: TransactionRecord = dataclasses.replace(
-            chia_tx, spend_bundle=SpendBundle.aggregate([chia_tx.spend_bundle, extra_spend_bundle])
-        )
-        return full_tx
+        async with action_scope.use() as interface:
+            interface.side_effects.extra_spends.append(extra_spend_bundle)

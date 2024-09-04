@@ -11,11 +11,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tupl
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from clvm.casts import int_from_bytes
 
-import chia.wallet.singleton
 from chia.full_node.full_node_api import FullNodeAPI
 from chia.protocols.wallet_protocol import CoinState, RequestBlockHeader, RespondBlockHeader
 from chia.server.ws_connection import WSChiaConnection
-from chia.types.announcement import Announcement
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.sized_bytes import bytes32
@@ -30,7 +28,7 @@ from chia.wallet.cat_wallet.cat_utils import unsigned_spend_bundle_for_spendable
 from chia.wallet.cat_wallet.cat_wallet import CATWallet
 from chia.wallet.cat_wallet.dao_cat_wallet import DAOCATWallet
 from chia.wallet.coin_selection import select_coins
-from chia.wallet.conditions import Condition, parse_timelock_info
+from chia.wallet.conditions import AssertCoinAnnouncement, Condition, parse_timelock_info
 from chia.wallet.dao_wallet.dao_info import DAOInfo, DAORules, ProposalInfo, ProposalType
 from chia.wallet.dao_wallet.dao_utils import (
     DAO_FINISHED_STATE,
@@ -75,6 +73,7 @@ from chia.wallet.util.tx_config import DEFAULT_TX_CONFIG, CoinSelectionConfig, T
 from chia.wallet.util.wallet_sync_utils import fetch_coin_spend
 from chia.wallet.util.wallet_types import WalletType
 from chia.wallet.wallet import Wallet
+from chia.wallet.wallet_action_scope import WalletActionScope
 from chia.wallet.wallet_coin_record import WalletCoinRecord
 from chia.wallet.wallet_info import WalletInfo
 
@@ -122,6 +121,7 @@ class DAOWallet:
         amount_of_cats: uint64,
         dao_rules: DAORules,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         filter_amount: uint64 = uint64(1),
         name: Optional[str] = None,
         fee: uint64 = uint64(0),
@@ -178,6 +178,7 @@ class DAOWallet:
             await self.generate_new_dao(
                 amount_of_cats,
                 tx_config,
+                action_scope,
                 fee=fee,
                 fee_for_cat=fee_for_cat,
             )
@@ -347,7 +348,7 @@ class DAOWallet:
         """
         Returns a set of coins that can be used for generating a new transaction.
         Note: Must be called under wallet state manager lock
-        There is no need for max/min coin amount or excluded amount becuase the dao treasury should
+        There is no need for max/min coin amount or excluded amount because the dao treasury should
         always be a single coin with amount 1
         """
         spendable_amount: uint128 = await self.get_spendable_balance()
@@ -387,7 +388,7 @@ class DAOWallet:
     async def get_balance_by_asset_type(self, asset_id: Optional[bytes32] = None) -> uint128:
         puzhash = get_p2_singleton_puzhash(self.dao_info.treasury_id, asset_id=asset_id)
         records = await self.wallet_state_manager.coin_store.get_coin_records_by_puzzle_hash(puzhash)
-        return uint128(sum([cr.coin.amount for cr in records if not cr.spent]))
+        return uint128(sum(cr.coin.amount for cr in records if not cr.spent))
 
     # if asset_id == None: then we get normal XCH
     async def select_coins_for_asset_type(self, amount: uint64, asset_id: Optional[bytes32] = None) -> List[Coin]:
@@ -509,9 +510,7 @@ class DAOWallet:
         assert children_state.created_height
         parent_spend = await fetch_coin_spend(children_state.created_height, parent_parent_coin, peer)
         assert parent_spend is not None
-        parent_inner_puz = chia.wallet.singleton.get_inner_puzzle_from_singleton(
-            parent_spend.puzzle_reveal.to_program()
-        )
+        parent_inner_puz = get_inner_puzzle_from_singleton(parent_spend.puzzle_reveal)
         if parent_inner_puz is None:  # pragma: no cover
             raise ValueError("get_innerpuzzle_from_puzzle failed")
 
@@ -609,11 +608,12 @@ class DAOWallet:
         self,
         amount_of_cats_to_create: Optional[uint64],
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         cat_tail_hash: Optional[bytes32] = None,
         fee: uint64 = uint64(0),
         fee_for_cat: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> Optional[SpendBundle]:
+    ) -> None:
         """
         Create a new DAO treasury using the dao_rules object. This does the first spend to create the launcher
         and eve coins.
@@ -650,7 +650,7 @@ class DAOWallet:
 
         genesis_launcher_puz = SINGLETON_LAUNCHER
         # launcher coin contains singleton launcher, launcher coin ID == singleton_id == treasury_id
-        launcher_coin = Coin(origin.name(), genesis_launcher_puz.get_tree_hash(), 1)
+        launcher_coin = Coin(origin.name(), genesis_launcher_puz.get_tree_hash(), uint64(1))
 
         if cat_tail_hash is None:
             assert amount_of_cats_to_create is not None
@@ -695,7 +695,9 @@ class DAOWallet:
                 cat_tail_info,
                 amount_of_cats_to_create,
                 DEFAULT_TX_CONFIG,
+                action_scope,
                 fee=fee_for_cat,
+                push=False,
             )
             assert new_cat_wallet is not None
         else:  # pragma: no cover
@@ -729,20 +731,21 @@ class DAOWallet:
         full_treasury_puzzle = curry_singleton(launcher_coin.name(), dao_treasury_puzzle)
         full_treasury_puzzle_hash = full_treasury_puzzle.get_tree_hash()
 
-        announcement_set: Set[Announcement] = set()
         announcement_message = Program.to([full_treasury_puzzle_hash, 1, bytes(0x80)]).get_tree_hash()
-        announcement_set.add(Announcement(launcher_coin.name(), announcement_message))
-        tx_records: List[TransactionRecord] = await self.standard_wallet.generate_signed_transaction(
+
+        await self.standard_wallet.generate_signed_transaction(
             uint64(1),
             genesis_launcher_puz.get_tree_hash(),
             tx_config,
+            action_scope,
             fee,
             origin_id=origin.name(),
             coins=set(coins),
-            coin_announcements_to_consume=announcement_set,
             memos=[new_cat_wallet.cat_info.limitations_program_hash, cat_origin.name()],
+            extra_conditions=(
+                AssertCoinAnnouncement(asserted_id=launcher_coin.name(), asserted_msg=announcement_message),
+            ),
         )
-        tx_record: TransactionRecord = tx_records[0]
 
         genesis_launcher_solution = Program.to([full_treasury_puzzle_hash, 1, bytes(0x80)])
 
@@ -755,9 +758,6 @@ class DAOWallet:
             uint64(launcher_coin.amount),
         )
         await self.add_parent(launcher_coin.name(), launcher_proof)
-
-        if tx_record is None or tx_record.spend_bundle is None:  # pragma: no cover
-            return None
 
         eve_coin = Coin(launcher_coin.name(), full_treasury_puzzle_hash, uint64(1))
         dao_info = DAOInfo(
@@ -775,8 +775,7 @@ class DAOWallet:
         )
         await self.save_info(dao_info)
         eve_spend = await self.generate_treasury_eve_spend(dao_treasury_puzzle, eve_coin)
-
-        full_spend = SpendBundle.aggregate([tx_record.spend_bundle, launcher_sb, eve_spend])
+        new_spend = SpendBundle.aggregate([launcher_sb, eve_spend])
 
         treasury_record = TransactionRecord(
             confirmed_at_height=uint32(0),
@@ -786,20 +785,17 @@ class DAOWallet:
             fee_amount=fee,
             confirmed=False,
             sent=uint32(10),
-            spend_bundle=full_spend,
-            additions=full_spend.additions(),
-            removals=full_spend.removals(),
+            spend_bundle=new_spend,
+            additions=new_spend.additions(),
+            removals=new_spend.removals(),
             wallet_id=self.id(),
             sent_to=[],
             trade_id=None,
             type=uint32(TransactionType.INCOMING_TX.value),
-            name=full_spend.name(),
+            name=eve_coin.name(),
             memos=[],
             valid_times=parse_timelock_info(extra_conditions),
         )
-        regular_record = dataclasses.replace(tx_record, spend_bundle=None)
-        await self.wallet_state_manager.add_pending_transaction(regular_record)
-        await self.wallet_state_manager.add_pending_transaction(treasury_record)
 
         funding_inner_puzhash = get_p2_singleton_puzhash(self.dao_info.treasury_id)
         await self.wallet_state_manager.add_interested_puzzle_hashes([funding_inner_puzhash], [self.id()])
@@ -807,7 +803,8 @@ class DAOWallet:
         await self.wallet_state_manager.add_interested_coin_ids([launcher_coin.name()], [self.wallet_id])
 
         await self.wallet_state_manager.add_interested_coin_ids([eve_coin.name()], [self.wallet_id])
-        return full_spend
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(treasury_record)
 
     async def generate_treasury_eve_spend(
         self, inner_puz: Program, eve_coin: Coin, fee: uint64 = uint64(0)
@@ -850,10 +847,11 @@ class DAOWallet:
         self,
         proposed_puzzle: Program,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         vote_amount: Optional[uint64] = None,
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         dao_rules = get_treasury_rules_from_puzzle(self.dao_info.current_treasury_innerpuz)
         coins = await self.standard_wallet.select_coins(
             uint64(fee + dao_rules.proposal_minimum_amount),
@@ -889,22 +887,22 @@ class DAOWallet:
         full_proposal_puzzle = curry_singleton(launcher_coin.name(), dao_proposal_puzzle)
         full_proposal_puzzle_hash = full_proposal_puzzle.get_tree_hash()
 
-        announcement_set: Set[Announcement] = set()
         announcement_message = Program.to(
             [full_proposal_puzzle_hash, dao_rules.proposal_minimum_amount, bytes(0x80)]
         ).get_tree_hash()
-        announcement_set.add(Announcement(launcher_coin.name(), announcement_message))
 
-        tx_records: List[TransactionRecord] = await self.standard_wallet.generate_signed_transaction(
+        await self.standard_wallet.generate_signed_transaction(
             uint64(dao_rules.proposal_minimum_amount),
             genesis_launcher_puz.get_tree_hash(),
             tx_config,
+            action_scope,
             fee,
             origin_id=origin.name(),
             coins=coins,
-            coin_announcements_to_consume=announcement_set,
+            extra_conditions=(
+                AssertCoinAnnouncement(asserted_id=launcher_coin.name(), asserted_msg=announcement_message),
+            ),
         )
-        tx_record: TransactionRecord = tx_records[0]
 
         genesis_launcher_solution = Program.to(
             [full_proposal_puzzle_hash, dao_rules.proposal_minimum_amount, bytes(0x80)]
@@ -936,31 +934,31 @@ class DAOWallet:
             launcher_coin=launcher_coin,
             vote_amount=vote_amount,
         )
-        assert tx_record
-        assert tx_record.spend_bundle is not None
 
-        full_spend = SpendBundle.aggregate([tx_record.spend_bundle, eve_spend, launcher_sb])
+        full_spend = SpendBundle.aggregate([eve_spend, launcher_sb])
 
-        record = TransactionRecord(
-            confirmed_at_height=uint32(0),
-            created_at_time=uint64(int(time.time())),
-            to_puzzle_hash=full_proposal_puzzle.get_tree_hash(),
-            amount=uint64(dao_rules.proposal_minimum_amount),
-            fee_amount=fee,
-            confirmed=False,
-            sent=uint32(10),
-            spend_bundle=full_spend,
-            additions=full_spend.additions(),
-            removals=full_spend.removals(),
-            wallet_id=self.id(),
-            sent_to=[],
-            trade_id=None,
-            type=uint32(TransactionType.INCOMING_TX.value),
-            name=full_spend.name(),
-            memos=[],
-            valid_times=parse_timelock_info(extra_conditions),
-        )
-        return record
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(
+                TransactionRecord(
+                    confirmed_at_height=uint32(0),
+                    created_at_time=uint64(int(time.time())),
+                    to_puzzle_hash=full_proposal_puzzle.get_tree_hash(),
+                    amount=uint64(dao_rules.proposal_minimum_amount),
+                    fee_amount=fee,
+                    confirmed=False,
+                    sent=uint32(10),
+                    spend_bundle=full_spend,
+                    additions=full_spend.additions(),
+                    removals=full_spend.removals(),
+                    wallet_id=self.id(),
+                    sent_to=[],
+                    trade_id=None,
+                    type=uint32(TransactionType.INCOMING_TX.value),
+                    name=full_spend.name(),
+                    memos=[],
+                    valid_times=parse_timelock_info(extra_conditions),
+                )
+            )
 
     async def generate_proposal_eve_spend(
         self,
@@ -1033,9 +1031,10 @@ class DAOWallet:
         vote_amount: Optional[uint64],
         is_yes_vote: bool,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         self.log.info(f"Trying to create a proposal close spend with ID: {proposal_id}")
         proposal_info = None
         for pi in self.dao_info.proposals_list:
@@ -1112,17 +1111,17 @@ class DAOWallet:
             ]
         )
         full_proposal_puzzle = curry_singleton(proposal_id, proposal_info.current_innerpuz)
-        list_of_coinspends = [make_spend(proposal_info.current_coin, full_proposal_puzzle, fullsol)]
-        unsigned_spend_bundle = SpendBundle(list_of_coinspends, G2Element())
+        list_of_coinspends = [
+            make_spend(proposal_info.current_coin, full_proposal_puzzle, fullsol),
+            *dao_cat_spend.coin_spends,
+        ]
+        spend_bundle = SpendBundle(list_of_coinspends, G2Element())
         if fee > 0:
-            chia_tx = await self.standard_wallet.create_tandem_xch_tx(
+            await self.standard_wallet.create_tandem_xch_tx(
                 fee,
                 tx_config,
+                action_scope,
             )
-            assert chia_tx.spend_bundle is not None
-            spend_bundle = unsigned_spend_bundle.aggregate([unsigned_spend_bundle, dao_cat_spend, chia_tx.spend_bundle])
-        else:
-            spend_bundle = unsigned_spend_bundle.aggregate([unsigned_spend_bundle, dao_cat_spend])
 
         record = TransactionRecord(
             confirmed_at_height=uint32(0),
@@ -1143,17 +1142,19 @@ class DAOWallet:
             memos=[],
             valid_times=parse_timelock_info(extra_conditions),
         )
-        return record
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(record)
 
     async def create_proposal_close_spend(
         self,
         proposal_id: bytes32,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         genesis_id: Optional[bytes32] = None,
         fee: uint64 = uint64(0),
         self_destruct: bool = False,
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         self.log.info(f"Trying to create a proposal close spend with ID: {proposal_id}")
         proposal_info = None
         for pi in self.dao_info.proposals_list:
@@ -1285,7 +1286,7 @@ class DAOWallet:
                         if cond.rest().first().as_atom() == cat_launcher.get_tree_hash():
                             cat_wallet: CATWallet = self.wallet_state_manager.wallets[self.dao_info.cat_wallet_id]
                             cat_tail_hash = cat_wallet.cat_info.limitations_program_hash
-                            mint_amount = cond.rest().rest().first().as_int()
+                            mint_amount = uint64(cond.rest().rest().first().as_int())
                             new_cat_puzhash = bytes32(cond.rest().rest().rest().first().first().as_atom())
                             eve_puzzle = curry_cat_eve(new_cat_puzhash)
                             if genesis_id is None:
@@ -1296,7 +1297,9 @@ class DAOWallet:
                             assert tail_reconstruction.get_tree_hash() == cat_tail_hash
                             assert isinstance(self.dao_info.current_treasury_coin, Coin)
                             cat_launcher_coin = Coin(
-                                self.dao_info.current_treasury_coin.name(), cat_launcher.get_tree_hash(), mint_amount
+                                self.dao_info.current_treasury_coin.name(),
+                                cat_launcher.get_tree_hash(),
+                                uint64(mint_amount),
                             )
                             full_puz = construct_cat_puzzle(CAT_MOD, cat_tail_hash, eve_puzzle)
 
@@ -1309,7 +1312,7 @@ class DAOWallet:
                                 ]
                             )
                             coin_spends.append(make_spend(cat_launcher_coin, cat_launcher, solution))
-                            eve_coin = Coin(cat_launcher_coin.name(), full_puz.get_tree_hash(), mint_amount)
+                            eve_coin = Coin(cat_launcher_coin.name(), full_puz.get_tree_hash(), uint64(mint_amount))
                             tail_solution = Program.to([cat_launcher_coin.parent_coin_info, cat_launcher_coin.amount])
                             solution = Program.to([mint_amount, tail_reconstruction, tail_solution])
                             new_spendable_cat = SpendableCAT(
@@ -1441,6 +1444,9 @@ class DAOWallet:
                 treasury_inner_puzhash = self.dao_info.current_treasury_innerpuz.get_tree_hash()
                 delegated_solution = Program.to([])
 
+            else:
+                raise Exception(f"Unknown proposal type: {proposal_type!r}")
+
             treasury_solution = Program.to(
                 [
                     [proposal_info.current_coin.name(), PROPOSED_PUZ_HASH.as_atom(), 0],
@@ -1472,13 +1478,12 @@ class DAOWallet:
         if self_destruct:
             spend_bundle = SpendBundle([proposal_cs, treasury_cs], AugSchemeMPL.aggregate([]))
         else:
+            # TODO: maybe we can refactor this to provide clarity around timer_cs having been defined
+            # pylint: disable-next=E0606
             spend_bundle = SpendBundle([proposal_cs, timer_cs, treasury_cs], AugSchemeMPL.aggregate([]))
         if fee > 0:
-            chia_tx = await self.standard_wallet.create_tandem_xch_tx(fee, tx_config)
-            assert chia_tx.spend_bundle is not None
-            full_spend = SpendBundle.aggregate([spend_bundle, chia_tx.spend_bundle])
-        else:
-            full_spend = SpendBundle.aggregate([spend_bundle])
+            await self.standard_wallet.create_tandem_xch_tx(fee, tx_config, action_scope)
+        full_spend = spend_bundle
         if cat_spend_bundle is not None:
             full_spend = full_spend.aggregate([full_spend, cat_spend_bundle])
         if delegated_puzzle_sb is not None:
@@ -1503,7 +1508,8 @@ class DAOWallet:
             memos=[],
             valid_times=parse_timelock_info(extra_conditions),
         )
-        return record
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(record)
 
     async def fetch_proposed_puzzle_reveal(self, proposal_id: bytes32) -> Program:
         wallet_node: Any = self.wallet_state_manager.wallet_node
@@ -1535,16 +1541,18 @@ class DAOWallet:
         funding_wallet: WalletProtocol[Any],
         amount: uint64,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> List[TransactionRecord]:
+    ) -> None:
         if funding_wallet.type() == WalletType.STANDARD_WALLET.value:
             p2_singleton_puzhash = get_p2_singleton_puzhash(self.dao_info.treasury_id, asset_id=None)
             wallet: Wallet = funding_wallet  # type: ignore[assignment]
-            return await wallet.generate_signed_transaction(
+            await wallet.generate_signed_transaction(
                 amount,
                 p2_singleton_puzhash,
                 tx_config,
+                action_scope,
                 fee=fee,
                 memos=[p2_singleton_puzhash],
             )
@@ -1553,14 +1561,14 @@ class DAOWallet:
             # generate_signed_transaction has a different type signature in Wallet and CATWallet
             # CATWallet uses a List of amounts and a List of puzhashes as the first two arguments
             p2_singleton_puzhash = get_p2_singleton_puzhash(self.dao_info.treasury_id)
-            tx_records: List[TransactionRecord] = await cat_wallet.generate_signed_transaction(
+            await cat_wallet.generate_signed_transaction(
                 [amount],
                 [p2_singleton_puzhash],
                 tx_config,
+                action_scope,
                 fee=fee,
                 extra_conditions=extra_conditions,
             )
-            return tx_records
         else:  # pragma: no cover
             raise ValueError(f"Assets of type {funding_wallet.type()} are not currently supported.")
 
@@ -1568,16 +1576,16 @@ class DAOWallet:
         self,
         amount: uint64,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         fee: uint64 = uint64(0),
         funding_wallet_id: uint32 = uint32(1),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         # set up the p2_singleton
         funding_wallet = self.wallet_state_manager.wallets[funding_wallet_id]
-        tx_record = await self._create_treasury_fund_transaction(
-            funding_wallet, amount, tx_config, fee, extra_conditions=extra_conditions
+        await self._create_treasury_fund_transaction(
+            funding_wallet, amount, tx_config, action_scope, fee, extra_conditions=extra_conditions
         )
-        return tx_record[0]
 
     async def fetch_singleton_lineage_proof(self, coin: Coin) -> LineageProof:
         wallet_node: Any = self.wallet_state_manager.wallet_node
@@ -1588,18 +1596,18 @@ class DAOWallet:
         assert state is not None
         # CoinState contains Coin, spent_height, and created_height,
         parent_spend = await fetch_coin_spend(state[0].spent_height, state[0].coin, peer)
-        parent_inner_puz = get_inner_puzzle_from_singleton(parent_spend.puzzle_reveal.to_program())
+        parent_inner_puz = get_inner_puzzle_from_singleton(parent_spend.puzzle_reveal)
         assert isinstance(parent_inner_puz, Program)
         return LineageProof(state[0].coin.parent_coin_info, parent_inner_puz.get_tree_hash(), state[0].coin.amount)
 
     async def free_coins_from_finished_proposals(
         self,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
         fee: uint64 = uint64(0),
         extra_conditions: Tuple[Condition, ...] = tuple(),
-    ) -> TransactionRecord:
+    ) -> None:
         dao_cat_wallet: DAOCATWallet = self.wallet_state_manager.wallets[self.dao_info.dao_cat_wallet_id]
-        full_spend = None
         spends = []
         closed_list = []
         finished_puz = None
@@ -1618,7 +1626,7 @@ class DAOWallet:
                 prop_sb = SpendBundle([cs], AugSchemeMPL.aggregate([]))
                 spends.append(prop_sb)
 
-        sb = await dao_cat_wallet.remove_active_proposal(closed_list, tx_config=tx_config)
+        sb = await dao_cat_wallet.remove_active_proposal(closed_list, tx_config=tx_config, action_scope=action_scope)
         spends.append(sb)
 
         if not spends:  # pragma: no cover
@@ -1626,9 +1634,7 @@ class DAOWallet:
 
         full_spend = SpendBundle.aggregate(spends)
         if fee > 0:
-            chia_tx = await self.standard_wallet.create_tandem_xch_tx(fee, tx_config)
-            assert chia_tx.spend_bundle is not None
-            full_spend = full_spend.aggregate([full_spend, chia_tx.spend_bundle])
+            await self.standard_wallet.create_tandem_xch_tx(fee, tx_config, action_scope)
 
         assert isinstance(finished_puz, Program)
         record = TransactionRecord(
@@ -1650,7 +1656,8 @@ class DAOWallet:
             memos=[],
             valid_times=parse_timelock_info(extra_conditions),
         )
-        return record
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(record)
 
     async def parse_proposal(self, proposal_id: bytes32) -> Dict[str, Any]:
         for prop_info in self.dao_info.proposals_list:
@@ -1765,9 +1772,10 @@ class DAOWallet:
         self,
         amount: uint64,
         tx_config: TXConfig,
+        action_scope: WalletActionScope,
     ) -> List[TransactionRecord]:
         dao_cat_wallet: DAOCATWallet = self.wallet_state_manager.wallets[self.dao_info.dao_cat_wallet_id]
-        return await dao_cat_wallet.enter_dao_cat_voting_mode(amount, tx_config)
+        return await dao_cat_wallet.enter_dao_cat_voting_mode(amount, tx_config, action_scope)
 
     @staticmethod
     def get_next_interesting_coin(spend: CoinSpend) -> Optional[Coin]:  # pragma: no cover

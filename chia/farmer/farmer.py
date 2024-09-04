@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import time
 import traceback
+from dataclasses import dataclass
 from math import floor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, List, Optional, Set, Tuple, Union, cast
@@ -18,7 +20,7 @@ from chia.daemon.keychain_proxy import KeychainProxy, connect_to_keychain_and_va
 from chia.farmer.og_pooling.pool_worker import PoolWorker
 from chia.plot_sync.delta import Delta
 from chia.plot_sync.receiver import Receiver
-from chia.pools.pool_config import PoolWalletConfig, add_auth_key, load_pool_config
+from chia.pools.pool_config import PoolWalletConfig, load_pool_config, update_pool_url
 from chia.protocols import farmer_protocol, harvester_protocol
 from chia.protocols.pool_protocol import (
     AuthenticationPayload,
@@ -47,6 +49,7 @@ from chia.util.hash import std_hash
 from chia.util.ints import uint8, uint16, uint32, uint64
 from chia.util.keychain import Keychain
 from chia.util.logging import TimedDuplicateFilter
+from chia.util.profiler import profile_task
 from chia.wallet.derive_keys import (
     find_authentication_sk,
     find_owner_sk,
@@ -63,6 +66,12 @@ log = logging.getLogger(__name__)
 UPDATE_POOL_INFO_INTERVAL: int = 3600
 UPDATE_POOL_INFO_FAILURE_RETRY_INTERVAL: int = 120
 UPDATE_POOL_FARMER_INFO_INTERVAL: int = 300
+
+
+@dataclass(frozen=True)
+class GetPoolInfoResult:
+    pool_info: Dict[str, Any]
+    new_pool_url: Optional[str]
 
 
 def strip_old_entries(pairs: List[Tuple[float, Any]], before: float) -> List[Tuple[float, Any]]:
@@ -186,6 +195,12 @@ class Farmer:
                     self.started = True
                     return
                 await asyncio.sleep(1)
+
+        if self.config.get("enable_profiler", False):
+            if sys.getprofile() is not None:
+                self.log.warning("not enabling profiler, getprofile() is already set")
+            else:
+                asyncio.create_task(profile_task(self._root_path, "farmer", self.log))
 
         asyncio.create_task(start_task())
         try:
@@ -331,16 +346,19 @@ class Farmer:
         if receiver.initial_sync() or harvester_updated:
             self.state_changed("harvester_update", receiver.to_dict(True))
 
-    async def _pool_get_pool_info(self, pool_config: PoolWalletConfig) -> Optional[Dict[str, Any]]:
+    async def _pool_get_pool_info(self, pool_config: PoolWalletConfig) -> Optional[GetPoolInfoResult]:
         try:
             async with aiohttp.ClientSession(trust_env=True) as session:
-                async with session.get(
-                    f"{pool_config.pool_url}/pool_info", ssl=ssl_context_for_root(get_mozilla_ca_crt(), log=self.log)
-                ) as resp:
+                url = f"{pool_config.pool_url}/pool_info"
+                async with session.get(url, ssl=ssl_context_for_root(get_mozilla_ca_crt(), log=self.log)) as resp:
                     if resp.ok:
                         response: Dict[str, Any] = json.loads(await resp.text())
                         self.log.info(f"GET /pool_info response: {response}")
-                        return response
+                        new_pool_url: Optional[str] = None
+                        if resp.url != url and all(r.status in {301, 308} for r in resp.history):
+                            new_pool_url = f"{resp.url}".replace("/pool_info", "")
+
+                        return GetPoolInfoResult(pool_info=response, new_pool_url=new_pool_url)
                     else:
                         self.handle_failed_pool_response(
                             pool_config.p2_singleton_puzzle_hash,
@@ -517,8 +535,6 @@ class Farmer:
                     self.log.error(f"Could not find authentication sk for {p2_singleton_puzzle_hash}")
                     continue
 
-                add_auth_key(self._root_path, pool_config, authentication_sk.get_g1())
-
                 if p2_singleton_puzzle_hash not in self.pool_state:
                     self.pool_state[p2_singleton_puzzle_hash] = {
                         "p2_singleton_puzzle_hash": p2_singleton_puzzle_hash.hex(),
@@ -564,14 +580,18 @@ class Farmer:
                 if time.time() >= pool_state["next_pool_info_update"]:
                     pool_state["next_pool_info_update"] = time.time() + UPDATE_POOL_INFO_INTERVAL
                     # Makes a GET request to the pool to get the updated information
-                    pool_info = await self._pool_get_pool_info(pool_config)
-                    if pool_info is not None and "error_code" not in pool_info:
+                    pool_info_result = await self._pool_get_pool_info(pool_config)
+                    if pool_info_result is not None and "error_code" not in pool_info_result.pool_info:
+                        pool_info = pool_info_result.pool_info
                         pool_state["authentication_token_timeout"] = pool_info["authentication_token_timeout"]
                         # Only update the first time from GET /pool_info, gets updated from GET /farmer later
                         if pool_state["current_difficulty"] is None:
                             pool_state["current_difficulty"] = pool_info["minimum_difficulty"]
                     else:
                         pool_state["next_pool_info_update"] = time.time() + UPDATE_POOL_INFO_FAILURE_RETRY_INTERVAL
+
+                    if pool_info_result is not None and pool_info_result.new_pool_url is not None:
+                        update_pool_url(self._root_path, pool_config, pool_info_result.new_pool_url)
 
                 if time.time() >= pool_state["next_farmer_update"]:
                     pool_state["next_farmer_update"] = time.time() + UPDATE_POOL_FARMER_INFO_INTERVAL
@@ -714,31 +734,33 @@ class Farmer:
     async def generate_login_link(self, launcher_id: bytes32) -> Optional[str]:
         for pool_state in self.pool_state.values():
             pool_config: PoolWalletConfig = pool_state["pool_config"]
-            if pool_config.launcher_id == launcher_id:
-                authentication_sk: Optional[PrivateKey] = self.get_authentication_sk(pool_config)
-                if authentication_sk is None:
-                    self.log.error(f"Could not find authentication sk for {pool_config.p2_singleton_puzzle_hash}")
-                    continue
-                authentication_token_timeout = pool_state["authentication_token_timeout"]
-                if authentication_token_timeout is None:
-                    self.log.error(
-                        f"No pool specific authentication_token_timeout has been set for"
-                        f"{pool_config.p2_singleton_puzzle_hash}, check communication with the pool."
-                    )
-                    return None
+            if pool_config.launcher_id != launcher_id:
+                continue
 
-                authentication_token = get_current_authentication_token(authentication_token_timeout)
-                message: bytes32 = std_hash(
-                    AuthenticationPayload(
-                        "get_login", pool_config.launcher_id, pool_config.target_puzzle_hash, authentication_token
-                    )
+            authentication_sk: Optional[PrivateKey] = self.get_authentication_sk(pool_config)
+            if authentication_sk is None:
+                self.log.error(f"Could not find authentication sk for {pool_config.p2_singleton_puzzle_hash}")
+                continue
+            authentication_token_timeout = pool_state["authentication_token_timeout"]
+            if authentication_token_timeout is None:
+                self.log.error(
+                    f"No pool specific authentication_token_timeout has been set for"
+                    f"{pool_config.p2_singleton_puzzle_hash}, check communication with the pool."
                 )
-                signature: G2Element = AugSchemeMPL.sign(authentication_sk, message)
-                return (
-                    pool_config.pool_url
-                    + f"/login?launcher_id={launcher_id.hex()}&authentication_token={authentication_token}"
-                    f"&signature={bytes(signature).hex()}"
+                return None
+
+            authentication_token = get_current_authentication_token(authentication_token_timeout)
+            message: bytes32 = std_hash(
+                AuthenticationPayload(
+                    "get_login", pool_config.launcher_id, pool_config.target_puzzle_hash, authentication_token
                 )
+            )
+            signature: G2Element = AugSchemeMPL.sign(authentication_sk, message)
+            return (
+                pool_config.pool_url
+                + f"/login?launcher_id={launcher_id.hex()}&authentication_token={authentication_token}"
+                f"&signature={bytes(signature).hex()}"
+            )
 
         return None
 

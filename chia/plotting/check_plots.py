@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 from collections import Counter
 from pathlib import Path
 from threading import Lock
@@ -24,6 +23,7 @@ from chia.plotting.util import (
 )
 from chia.util.bech32m import encode_puzzle_hash
 from chia.util.config import load_config
+from chia.util.cpu import available_logical_cores
 from chia.util.hash import std_hash
 from chia.util.ints import uint32
 from chia.util.keychain import Keychain
@@ -57,8 +57,7 @@ def check_plots(
 
     context_count = config["harvester"].get("parallel_decompressor_count", 5)
     thread_count = config["harvester"].get("decompressor_thread_count", 0)
-    cpu_count = os.cpu_count()
-    assert cpu_count is not None
+    cpu_count = available_logical_cores()
     if thread_count == 0:
         thread_count = cpu_count // 2
     disable_cpu_affinity = config["harvester"].get("disable_cpu_affinity", False)
