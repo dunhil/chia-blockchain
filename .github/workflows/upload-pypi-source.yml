@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   mypy:
-    name: ${{ matrix.os.emoji }} ${{ matrix.check.name }} - ${{ matrix.os.name }} ${{ matrix.arch.name }} ${{ matrix.python.major_dot_minor }}
+    name: ${{ matrix.os.emoji }} ${{ matrix.arch.emoji }} ${{ matrix.check.name }} - ${{ matrix.os.name }} ${{ matrix.python.major_dot_minor }}
     runs-on: ${{ matrix.os.runs-on[matrix.arch.matrix] }}
     timeout-minutes: 20
     strategy:
@@ -52,11 +52,12 @@ jobs:
               intel: windows-latest
         arch:
           - name: ARM64
+            emoji: 💪
             matrix: arm
           - name: Intel
+            emoji: 🌀
             matrix: intel
         python:
-          - major_dot_minor: "3.8"
           - major_dot_minor: "3.9"
           - major_dot_minor: "3.10"
           - major_dot_minor: "3.11"
@@ -68,12 +69,6 @@ jobs:
               python manage-mypy.py build-mypy-ini
               mypy
         exclude:
-          - os:
-              matrix: macos
-            arch:
-              matrix: arm
-            python:
-              major_dot_minor: "3.8"
           - os:
               matrix: windows
             arch:
@@ -125,12 +120,8 @@ jobs:
         python:
           - major_dot_minor: "3.10"
         check:
-          - name: black
-            command: black --check --diff .
-          - name: flake8
-            command: flake8 benchmarks build_scripts chia tools *.py
-          - name: pylint
-            command: pylint benchmarks build_scripts chia tools *.py
+          - name: ruff
+            command: ruff format --check --diff .
           - name: generated protocol tests
             command: |
               python3 -m chia._tests.util.build_network_protocol_files
@@ -138,6 +129,15 @@ jobs:
           - name: poetry
             command: |
               .penv/bin/poetry check
+          - name: actionlint
+            command: |
+              bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+              echo ==== shellcheck version
+              shellcheck --version
+              echo ==== actionlint version
+              ./actionlint --version
+              echo ==== running actionlint
+              ./actionlint -color -shellcheck shellcheck
 
     steps:
       - uses: chia-network/actions/clean-workspace@main
@@ -174,7 +174,8 @@ jobs:
       - check
     strategy:
       matrix:
-        python-version: [3.8]
+        python:
+          - major_dot_minor: "3.10"
         os: [ubuntu-latest]
 
     steps:
@@ -190,7 +191,7 @@ jobs:
       - uses: Chia-Network/actions/setup-python@main
         name: Install Python
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python.major_dot_minor }}
 
       - uses: ./.github/actions/install
         with:
