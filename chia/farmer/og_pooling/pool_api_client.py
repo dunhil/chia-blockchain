@@ -50,9 +50,13 @@ class PoolApiClient:
                                   ) as res:
                 return await res.json()
 
-    async def submit_partial(self, submit_partial: SubmitPartialOG) -> Dict:
+    async def submit_partial(self, submit_partial: SubmitPartialOG, peer_version: str) -> Dict:
         return await post_partial(f"{self.base_url}/og/partial",
                                   json=submit_partial.to_json_dict(),
                                   ssl=ssl_context_for_root(get_mozilla_ca_crt(), log=self.log),
-                                  headers={"User-Agent": f"Chia Blockchain v.{__version__}"},
+                                  headers={
+                                      "User-Agent": f"Chia Blockchain v.{__version__}",
+                                      "chia-farmer-version": __version__,
+                                      "chia-harvester-version": peer_version,
+                                  },
                                   )

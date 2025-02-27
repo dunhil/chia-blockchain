@@ -255,7 +255,7 @@ class PoolWorker:
 
         submit_response: Dict
         try:
-            submit_response = await self.pool_client.submit_partial(submit_partial)
+            submit_response = await self.pool_client.submit_partial(submit_partial, peer.version)
         except Exception as e:
             self.log.error(f"Error submitting partial to pool {self.pool_url}: {e}")
             return
